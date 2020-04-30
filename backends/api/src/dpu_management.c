@@ -1,0 +1,470 @@
+/* Copyright 2020 UPMEM. All rights reserved.
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#define _GNU_SOURCE
+#include <inttypes.h>
+
+#include <dpu_attributes.h>
+#include <dpu_program.h>
+#include <dpu_types.h>
+#include <dpu_management.h>
+
+#include <dpu_rank.h>
+#include <dpu_profile.h>
+#include <dpu_api_log.h>
+#include <dpu_properties_loader.h>
+
+#define API_DEFAULT_BACKEND HW
+
+__API_SYMBOL__ struct dpu_t *
+dpu_get(struct dpu_rank_t *rank, dpu_slice_id_t slice_id, dpu_member_id_t dpu_id)
+{
+    uint8_t nr_slices = rank->description->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus = rank->description->topology.nr_of_dpus_per_control_interface;
+    uint32_t dpu_index = (nr_dpus * slice_id) + dpu_id;
+
+    if ((slice_id >= nr_slices) || (dpu_id >= nr_dpus)) {
+        return NULL;
+    }
+
+    return rank->dpus + dpu_index;
+}
+
+__API_SYMBOL__ struct dpu_rank_t *
+dpu_get_rank(struct dpu_t *dpu)
+{
+    return dpu->rank;
+}
+
+__API_SYMBOL__ dpu_slice_id_t
+dpu_get_slice_id(struct dpu_t *dpu)
+{
+    return dpu->slice_id;
+}
+
+__API_SYMBOL__ dpu_member_id_t
+dpu_get_member_id(struct dpu_t *dpu)
+{
+    return dpu->dpu_id;
+}
+
+__API_SYMBOL__ bool
+dpu_is_enabled(struct dpu_t *dpu)
+{
+    return dpu->enabled;
+}
+
+__API_SYMBOL__ dpu_description_t
+dpu_get_description(struct dpu_rank_t *rank)
+{
+    return rank->description;
+}
+
+__API_SYMBOL__ dpu_id_t
+dpu_get_id(struct dpu_t *dpu)
+{
+    return (dpu_id_t)((dpu->rank->rank_id << 16) | ((dpu->slice_id & 0xff) << 8) | (dpu->dpu_id & 0xff));
+}
+
+__API_SYMBOL__ void
+dpu_lock_rank(struct dpu_rank_t *rank)
+{
+    pthread_mutex_lock(&rank->mutex);
+}
+
+__API_SYMBOL__ void
+dpu_unlock_rank(struct dpu_rank_t *rank)
+{
+    pthread_mutex_unlock(&rank->mutex);
+}
+
+static dpu_error_t
+determine_backend_type_from_complete_profile(dpu_properties_t properties, dpu_type_t *backend)
+{
+    char *backend_string;
+    dpu_type_t default_type = API_DEFAULT_BACKEND;
+
+    if (!fetch_string_property(properties, DPU_PROFILE_PROPERTY_BACKEND, &backend_string, NULL)) {
+        return DPU_ERR_SYSTEM;
+    }
+
+    dpu_error_t status = DPU_OK;
+    if (backend_string == NULL) {
+        *backend = default_type;
+    } else if (!dpu_type_from_profile_string(backend_string, backend)) {
+        status = DPU_ERR_INVALID_PROFILE;
+    }
+
+    free(backend_string);
+    return status;
+}
+
+__API_SYMBOL__ dpu_error_t
+dpu_get_profile_description(const char *profile, dpu_description_t *description)
+{
+    dpu_description_t dpu_description;
+    dpu_error_t status;
+    dpu_rank_handler_context_t handler_context;
+    dpu_properties_t properties;
+
+    if ((dpu_description = malloc(sizeof(*dpu_description))) == NULL) {
+        status = DPU_ERR_SYSTEM;
+        goto end;
+    }
+
+    properties = dpu_properties_load_from_profile(profile);
+    if (properties == DPU_PROPERTIES_INVALID) {
+        status = DPU_ERR_INVALID_PROFILE;
+        goto free_description;
+    }
+
+    dpu_type_t type;
+
+    if ((status = determine_backend_type_from_complete_profile(properties, &type)) != DPU_OK) {
+        goto delete_properties;
+    }
+
+    if (!dpu_rank_handler_instantiate(type, &handler_context, false)) {
+        status = DPU_ERR_ALLOCATION;
+        goto delete_properties;
+    }
+
+    if (handler_context->handler->fill_description_from_profile(properties, dpu_description) != DPU_RANK_SUCCESS) {
+        status = DPU_ERR_INVALID_PROFILE;
+        goto delete_properties;
+    }
+
+    dpu_acquire_description(dpu_description);
+
+    *description = dpu_description;
+
+    dpu_properties_delete(properties);
+
+    return DPU_OK;
+
+delete_properties:
+    dpu_properties_delete(properties);
+free_description:
+    free(dpu_description);
+end:
+    return status;
+}
+
+static dpu_error_t
+dpu_get_profiling_properties(struct dpu_rank_t *dpu_rank, dpu_properties_t properties)
+{
+    dpu_slice_id_t slice_id;
+    dpu_member_id_t dpu_id;
+    char *enable_profiling, *mcount_address, *ret_mcount_address, *thread_profiling_address, *profiling_dpu_id,
+        *profiling_slice_id;
+
+    /* Profiling profile */
+    if (!fetch_string_property(properties, DPU_PROFILE_PROPERTY_ENABLE_PROFILING, &enable_profiling, NULL))
+        return DPU_ERR_INTERNAL;
+
+    if (!fetch_string_property(properties, DPU_PROFILE_PROPERTY_PROFILING_DPU_ID, &profiling_dpu_id, NULL))
+        return DPU_ERR_INTERNAL;
+
+    if (profiling_dpu_id) {
+        sscanf(profiling_dpu_id, "%" SCNu8, &dpu_id);
+        free(profiling_dpu_id);
+    } else
+        dpu_id = 0;
+
+    if (!fetch_string_property(properties, DPU_PROFILE_PROPERTY_PROFILING_SLICE_ID, &profiling_slice_id, NULL))
+        return DPU_ERR_INTERNAL;
+
+    if (profiling_slice_id) {
+        sscanf(profiling_slice_id, "%" SCNu8, &slice_id);
+        free(profiling_slice_id);
+    } else
+        slice_id = 0;
+
+    dpu_rank->profiling_context.dpu = dpu_get(dpu_rank, slice_id, dpu_id);
+
+    if (!enable_profiling) {
+        /* If profiling is not explicitly required by user, we must nopify all mcount references if any */
+        dpu_rank->profiling_context.enable_profiling = DPU_PROFILING_NOP;
+    } else if (enable_profiling) {
+        enum dpu_profiling_type_e profiling_type;
+
+        if (!strcmp(enable_profiling, "statistics")) {
+            profiling_type = DPU_PROFILING_STATS;
+        } else if (!strcmp(enable_profiling, "nop")) {
+            profiling_type = DPU_PROFILING_NOP;
+        } else if (!strcmp(enable_profiling, "mcount")) {
+            profiling_type = DPU_PROFILING_MCOUNT;
+        } else if (!strcmp(enable_profiling, "samples")) {
+            profiling_type = DPU_PROFILING_SAMPLES;
+            if ((dpu_rank->profiling_context.sample_stats
+                    = calloc(dpu_rank->description->memories.iram_size, sizeof(*(dpu_rank->profiling_context.sample_stats))))
+                == NULL) {
+
+                return DPU_ERR_SYSTEM;
+            }
+        } else {
+            LOG_RANK(WARNING, dpu_rank, "Profiling type %s is unknown", enable_profiling);
+            return DPU_ERR_INTERNAL;
+        }
+
+        free(enable_profiling);
+
+        dpu_rank->profiling_context.enable_profiling = profiling_type;
+
+        if (!fetch_string_property(properties, DPU_PROFILE_PROPERTY_MCOUNT_ADDRESS, &mcount_address, NULL))
+            return DPU_ERR_INTERNAL;
+
+        if (mcount_address) {
+            sscanf(mcount_address, "%" SCNx16, &dpu_rank->profiling_context.mcount_address);
+            free(mcount_address);
+        } else
+            dpu_rank->profiling_context.mcount_address = 0;
+
+        if (!fetch_string_property(properties, DPU_PROFILE_PROPERTY_RET_MCOUNT_ADDRESS, &ret_mcount_address, NULL))
+            return DPU_ERR_INTERNAL;
+
+        if (ret_mcount_address) {
+            sscanf(ret_mcount_address, "%" SCNx16, &dpu_rank->profiling_context.ret_mcount_address);
+            free(ret_mcount_address);
+        } else
+            dpu_rank->profiling_context.ret_mcount_address = 0;
+
+        if (!fetch_string_property(properties, DPU_PROFILE_PROPERTY_THREAD_PROFILING_ADDRESS, &thread_profiling_address, NULL))
+            return DPU_ERR_INTERNAL;
+
+        if (thread_profiling_address) {
+            sscanf(thread_profiling_address, "%" SCNx32, &dpu_rank->profiling_context.thread_profiling_address);
+            free(thread_profiling_address);
+        } else
+            dpu_rank->profiling_context.thread_profiling_address = 0;
+    }
+
+    return DPU_OK;
+}
+
+__API_SYMBOL__ dpu_error_t
+dpu_get_rank_of_type(const char *profile, struct dpu_rank_t **rank)
+{
+    LOG_FN(VERBOSE, "");
+
+    dpu_error_t status;
+    struct dpu_rank_t *dpu_rank;
+    dpu_properties_t properties;
+    bool disable_mux_switch;
+
+    properties = dpu_properties_load_from_profile(profile);
+    if (properties == DPU_PROPERTIES_INVALID) {
+        status = DPU_ERR_INVALID_PROFILE;
+        goto end;
+    }
+
+    dpu_rank = calloc(1, sizeof(*dpu_rank));
+    if (dpu_rank == NULL) {
+        status = DPU_ERR_SYSTEM;
+        goto delete_properties;
+    }
+
+    if ((status = determine_backend_type_from_complete_profile(properties, &dpu_rank->type)) != DPU_OK) {
+        goto free_link;
+    }
+
+    if (!dpu_rank_handler_instantiate(dpu_rank->type, &dpu_rank->handler_context, true)) {
+        status = DPU_ERR_ALLOCATION;
+        goto free_link;
+    }
+
+    if (!dpu_rank_handler_get_rank(dpu_rank, dpu_rank->handler_context, properties)) {
+        status = DPU_ERR_ALLOCATION;
+        goto release_handler;
+    }
+
+    /* Profiling profile */
+    status = dpu_get_profiling_properties(dpu_rank, properties);
+    if (status != DPU_OK)
+        goto free_dpus;
+
+    /* Mux MRAM disable */
+    if (!fetch_boolean_property(properties, DPU_PROFILE_PROPERTY_DISABLE_MUX_SWITCH, &disable_mux_switch, false)) {
+        status = DPU_ERR_INTERNAL;
+        goto free_dpus;
+    }
+
+    if (disable_mux_switch) {
+        dpu_rank->description->configuration.init_mram_mux = false;
+        dpu_rank->description->configuration.api_must_switch_mram_mux = false;
+    }
+
+    dpu_properties_log_unused(properties, __vc());
+
+    pthread_mutexattr_t mutex_attr;
+    if (pthread_mutexattr_init(&mutex_attr) != 0) {
+        status = DPU_ERR_SYSTEM;
+        goto free_dpus;
+    }
+    pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE);
+    if (pthread_mutex_init(&(dpu_rank->mutex), &mutex_attr) != 0) {
+        pthread_mutexattr_destroy(&mutex_attr);
+        status = DPU_ERR_SYSTEM;
+        goto free_dpus;
+    }
+    pthread_mutexattr_destroy(&mutex_attr);
+
+    *rank = dpu_rank;
+    goto delete_properties;
+
+free_dpus:
+    free(dpu_rank->dpus);
+release_handler:
+    dpu_rank_handler_release(dpu_rank->handler_context);
+free_link:
+    free(dpu_rank);
+delete_properties:
+    dpu_properties_delete(properties);
+end:
+    return status;
+}
+
+__API_SYMBOL__ dpu_error_t
+dpu_free_rank(struct dpu_rank_t *rank)
+{
+    LOG_RANK(VERBOSE, rank, "");
+
+    uint8_t nr_dpus
+        = rank->description->topology.nr_of_control_interfaces * rank->description->topology.nr_of_dpus_per_control_interface;
+
+    uint8_t nr_threads = rank->description->dpu.nr_of_threads;
+
+    if (rank->runtime.run_context.poll_thread.thr_exists) {
+        pthread_mutex_lock(&(rank->runtime.run_context.poll_thread.thr_mutex));
+        rank->runtime.run_context.poll_thread.thr_has_work = -1;
+        pthread_mutex_unlock(&(rank->runtime.run_context.poll_thread.thr_mutex));
+
+        /* Ok if we can't signal a thread, let's go on anyway... */
+        pthread_cond_signal(&(rank->runtime.run_context.poll_thread.thr_cond));
+        pthread_join(rank->runtime.run_context.poll_thread.thr_id, NULL);
+    }
+
+    for (int each_dpu = 0; each_dpu < nr_dpus; ++each_dpu) {
+        struct dpu_t *dpu = rank->dpus + each_dpu;
+
+        if (dpu->poll_thread.thr_exists) {
+            pthread_mutex_lock(&(dpu->poll_thread.thr_mutex));
+            dpu->poll_thread.thr_has_work = -1;
+            pthread_mutex_unlock(&(dpu->poll_thread.thr_mutex));
+
+            /* Ok if we can't signal a thread, let's go on anyway... */
+            pthread_cond_signal(&(dpu->poll_thread.thr_cond));
+            pthread_join(dpu->poll_thread.thr_id, NULL);
+        }
+
+        dpu_free_program(dpu->program);
+        dpu_free_dpu_context(dpu->debug_context);
+    }
+    free(rank->dpus);
+
+    if (rank->profiling_context.mcount_stats) {
+        for (uint8_t th_id = 0; th_id < nr_threads; ++th_id)
+            if (rank->profiling_context.mcount_stats[th_id] != NULL) {
+                free(rank->profiling_context.mcount_stats[th_id]);
+            }
+
+        free(rank->profiling_context.mcount_stats);
+    }
+
+    if (rank->profiling_context.sample_stats) {
+        free(rank->profiling_context.sample_stats);
+    }
+
+    dpu_lock_rank(rank);
+    dpu_rank_handler_free_rank(rank, rank->handler_context);
+    dpu_unlock_rank(rank);
+
+    pthread_mutex_destroy(&(rank->mutex));
+    free(rank);
+
+    return DPU_OK;
+}
+
+__API_SYMBOL__ struct dpu_set_t
+dpu_set_from_rank(struct dpu_rank_t **rank)
+{
+    struct dpu_set_t set = { .kind = DPU_SET_RANKS,
+        .list = {
+            .nr_ranks = 1,
+            .ranks = rank,
+        } };
+
+    return set;
+}
+
+__API_SYMBOL__ struct dpu_set_t
+dpu_set_from_dpu(struct dpu_t *dpu)
+{
+    struct dpu_set_t set = {
+        .kind = DPU_SET_DPU,
+        .dpu = dpu,
+    };
+
+    return set;
+}
+
+__API_SYMBOL__ struct dpu_rank_t *
+dpu_rank_from_set(struct dpu_set_t set)
+{
+    if (set.kind != DPU_SET_RANKS || set.list.nr_ranks != 1) {
+        return NULL;
+    }
+    return set.list.ranks[0];
+}
+
+__API_SYMBOL__ struct dpu_t *
+dpu_from_set(struct dpu_set_t set)
+{
+    if (set.kind != DPU_SET_DPU) {
+        return NULL;
+    }
+    return set.dpu;
+}
+
+static void
+advance_to_next_dpu_in_rank(struct dpu_iterator_t *iterator)
+{
+    struct dpu_rank_t *rank = iterator->rank;
+    uint32_t dpu_idx = iterator->next_idx;
+
+    uint8_t nr_cis = rank->description->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus_per_ci = rank->description->topology.nr_of_dpus_per_control_interface;
+    uint32_t nr_dpus = nr_cis * nr_dpus_per_ci;
+
+    for (; dpu_idx < nr_dpus; ++dpu_idx) {
+        struct dpu_t *dpu = rank->dpus + dpu_idx;
+        if (dpu->enabled) {
+            iterator->has_next = true;
+            iterator->next_idx = dpu_idx + 1;
+            iterator->next = dpu;
+            return;
+        }
+    }
+
+    iterator->has_next = false;
+}
+
+__API_SYMBOL__ struct dpu_iterator_t
+dpu_iterator_from(struct dpu_rank_t *rank)
+{
+    struct dpu_iterator_t iterator;
+    iterator.rank = rank;
+    iterator.count = 0;
+    iterator.next_idx = 0;
+    advance_to_next_dpu_in_rank(&iterator);
+    return iterator;
+}
+
+__API_SYMBOL__ void
+dpu_iterator_next(struct dpu_iterator_t *iterator)
+{
+    iterator->count++;
+    advance_to_next_dpu_in_rank(iterator);
+}
