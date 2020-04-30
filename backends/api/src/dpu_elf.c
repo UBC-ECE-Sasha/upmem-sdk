@@ -3,10 +3,6 @@
  * found in the LICENSE file.
  */
 
-#include "dpu_elf_internals.h"
-#include "dpu_elf.h"
-#include "runtime_info.h"
-
 #include <stdlib.h>
 #include <libelf.h>
 #include <fcntl.h>
@@ -14,6 +10,9 @@
 #include <gelf.h>
 #include <memory.h>
 #include <dpu_attributes.h>
+#include <dpu_elf_internals.h>
+#include <dpu_elf.h>
+#include <runtime_info.h>
 
 //#define DPU_ELF_VERBOSE
 #ifdef DPU_ELF_VERBOSE
@@ -552,52 +551,63 @@ free_runtime_info(dpu_elf_runtime_info_t *runtime_info)
     }
 }
 
-static char string_table[] = { "\0"
-                               ".text\0"
-                               ".data\0"
-                               ".mram\0"
-                               ".regs\0"
-                               ".shstrtab\0"
-                               ".strtab\0"
-                               ".symtab\0"
-                               "\0" };
-
 static uint32_t
-find_section_offset_in_string_table(const char *section_name)
+add_section_in_string_table(const char *section_name, char **string_table, size_t *string_table_size)
 {
-    char *curr_string_table = string_table + 1;
-    while (true) {
-        if (!strcmp(curr_string_table, section_name))
-            return ((uintptr_t)curr_string_table) - ((uintptr_t)string_table);
-        curr_string_table += strlen(curr_string_table) + 1;
-        if (*curr_string_table == '\0')
-            return 0;
-    }
+    uint32_t section_name_size = strlen(section_name);
+    uint32_t offset_in_string_table = *string_table_size;
+    size_t new_size = *string_table_size + section_name_size + 1;
+    char *new_table = realloc(*string_table, new_size + 1);
+
+    strcpy(&new_table[offset_in_string_table], section_name);
+    new_table[new_size - 1] = '\0';
+    new_table[new_size] = '\0';
+
+    *string_table_size = new_size;
+    *string_table = new_table;
+
+    return offset_in_string_table;
 }
 
-static void
-dpu_elf_create_section(Elf_Data *data,
-    Elf32_Shdr *shdr,
-    Elf32_Phdr *phdr,
-    uint32_t section_addr,
-    uint8_t *buffer,
-    uint32_t buffer_size,
-    const char *section_name)
+typedef enum {
+    CORE_DUMP_DATA_SECTION,
+    CORE_DUMP_TEXT_SECTION,
+    CORE_DUMP_REGS_SECTION,
+    CORE_DUMP_MRAM_SECTION,
+    CORE_DUMP_NB_SECTION,
+} core_dump_section_e;
+
+static const char *core_dump_section_to_string[CORE_DUMP_NB_SECTION] = {
+    [CORE_DUMP_DATA_SECTION] = ".data",
+    [CORE_DUMP_TEXT_SECTION] = ".text",
+    [CORE_DUMP_REGS_SECTION] = ".regs",
+    [CORE_DUMP_MRAM_SECTION] = ".mram",
+};
+#define SHSTRTAB_SECTION_NAME ".shstrtab"
+#define SYMTAB_SECTION_NAME ".symtab"
+#define STRTAB_SECTION_NAME ".strtab"
+
+static bool
+section_can_be_copied(const char *section_name)
 {
-    data->d_buf = buffer;
-    data->d_size = buffer_size;
-
-    shdr->sh_name = find_section_offset_in_string_table(section_name);
-    shdr->sh_addr = section_addr;
-
-    phdr->p_vaddr = section_addr;
-    phdr->p_paddr = section_addr;
-    phdr->p_memsz = buffer_size;
-    phdr->p_filesz = buffer_size;
+    if (!strncmp(section_name, SHSTRTAB_SECTION_NAME, strlen(SHSTRTAB_SECTION_NAME)))
+        return false;
+    for (unsigned int each_section = 0; each_section < CORE_DUMP_NB_SECTION; each_section++) {
+        const char *core_dump_section_name = core_dump_section_to_string[each_section];
+        if (!strncmp(section_name, core_dump_section_name, strlen(core_dump_section_name)))
+            return false;
+    }
+    return true;
 }
 
 static dpu_error_t
-dpu_elf_copy_section(Elf_Scn *scn_out, Elf_Scn *scn_in, const char *section_name)
+dpu_elf_copy_section(Elf_Scn *scn_out,
+    Elf_Scn *scn_in,
+    const char *section_name,
+    char **string_table,
+    size_t *string_table_size,
+    Elf32_Shdr **shdr_symtab,
+    uint32_t *strtab_idx)
 {
     Elf_Data *data_in, *data_out;
     GElf_Shdr shdr_in;
@@ -617,7 +627,15 @@ dpu_elf_copy_section(Elf_Scn *scn_out, Elf_Scn *scn_in, const char *section_name
     }
 
     shdr_out = elf32_getshdr(scn_out);
-    shdr_out->sh_name = find_section_offset_in_string_table(section_name);
+    shdr_out->sh_name = add_section_in_string_table(section_name, string_table, string_table_size);
+    shdr_out->sh_type = shdr_in.sh_type;
+    shdr_out->sh_flags = shdr_in.sh_flags;
+    shdr_out->sh_entsize = shdr_in.sh_entsize;
+
+    if (!strncmp(section_name, SYMTAB_SECTION_NAME, strlen(SYMTAB_SECTION_NAME)))
+        *shdr_symtab = shdr_out;
+    if (!strncmp(section_name, STRTAB_SECTION_NAME, strlen(STRTAB_SECTION_NAME)))
+        *strtab_idx = elf_ndxscn(scn_out);
 
     return DPU_OK;
 }
@@ -634,45 +652,36 @@ dpu_elf_create_core_dump(const char *exe_path,
     uint32_t iram_size,
     uint32_t context_size)
 {
-    const unsigned int nb_section = 4;
-    Elf_Data *data[nb_section];
-    Elf32_Shdr *shdr[nb_section];
-    dpu_elf_file_t exe_elf;
     dpu_error_t elf_status;
-    elf_status = dpu_elf_open(exe_path, &exe_elf);
-    if (elf_status != DPU_OK)
-        return elf_status;
+    // INITIALIZE STRING_TABLE STUFF
+    size_t string_table_size = 1;
+    char *string_table = (char *)malloc(string_table_size + 1);
+    string_table[0] = '\0';
 
-    elf_fd elf_info = (elf_fd)exe_elf;
-    Elf_Scn *symtab_scn_in = elf_getscn(elf_info->elf, elf_info->symtab_index);
-    Elf_Scn *strtab_scn_in = elf_getscn(elf_info->elf, elf_info->strtab_index);
-
-    if (symtab_scn_in == NULL || strtab_scn_in == NULL) {
-        elf_status = DPU_ERR_ELF_INVALID_FILE;
-        goto core_dump_close_exe_elf;
-    }
-
+    // CHECK ELF_VERSION
     if (elf_version(EV_CURRENT) == EV_NONE) {
         elf_status = DPU_ERR_INTERNAL;
-        goto core_dump_close_exe_elf;
+        goto core_dump_free_string_table;
     }
 
+    // OPEN OUTPUT ELF FILE AND STRUCTURE
     int fd = open(core_file_path, O_WRONLY | O_CREAT, 444);
     if (fd < 0) {
         elf_status = DPU_ERR_ELF_NO_SUCH_FILE;
-        goto core_dump_close_exe_elf;
+        goto core_dump_free_string_table;
     }
 
-    Elf *elf_fd = elf_begin(fd, ELF_C_WRITE, NULL);
-    if (elf_fd == NULL) {
+    Elf *elf_output_fd = elf_begin(fd, ELF_C_WRITE, NULL);
+    if (elf_output_fd == NULL) {
         elf_status = DPU_ERR_INTERNAL;
         goto core_dump_close_fd;
     }
 
-    Elf32_Ehdr *ehdr = elf32_newehdr(elf_fd);
+    // CREATE AND INIT EHDR
+    Elf32_Ehdr *ehdr = elf32_newehdr(elf_output_fd);
     if (ehdr == NULL) {
         elf_status = DPU_ERR_INTERNAL;
-        goto core_dump_end_elf_fd;
+        goto core_dump_end_elf_output_fd;
     }
 
     ehdr->e_ident[EI_DATA] = 0; // endianness = LITTLE ENDIAN
@@ -680,101 +689,160 @@ dpu_elf_create_core_dump(const char *exe_path,
     ehdr->e_type = ET_CORE;
     ehdr->e_version = EV_CURRENT;
 
-    Elf32_Phdr *phdr = elf32_newphdr(elf_fd, nb_section);
+    // CREATE PHDR
+    Elf32_Phdr *phdr = elf32_newphdr(elf_output_fd, CORE_DUMP_NB_SECTION);
     if (phdr == NULL) {
         elf_status = DPU_ERR_INTERNAL;
-        goto core_dump_end_elf_fd;
+        goto core_dump_end_elf_output_fd;
     }
 
+    // CREATE CORE DUMP SPECIFIC SECTIONS
+    Elf32_Shdr *shdr[CORE_DUMP_NB_SECTION];
+    uint32_t section_addr[CORE_DUMP_NB_SECTION] = {
+        [CORE_DUMP_TEXT_SECTION] = 0x80000000,
+        [CORE_DUMP_DATA_SECTION] = 0x00000000,
+        [CORE_DUMP_MRAM_SECTION] = 0x08000000,
+        [CORE_DUMP_REGS_SECTION] = 0xa0000000,
+    };
+    uint8_t *buffer[CORE_DUMP_NB_SECTION] = {
+        [CORE_DUMP_TEXT_SECTION] = iram,
+        [CORE_DUMP_DATA_SECTION] = wram,
+        [CORE_DUMP_MRAM_SECTION] = mram,
+        [CORE_DUMP_REGS_SECTION] = context,
+    };
+    uint32_t buffer_size[CORE_DUMP_NB_SECTION] = {
+        [CORE_DUMP_TEXT_SECTION] = iram_size,
+        [CORE_DUMP_DATA_SECTION] = wram_size,
+        [CORE_DUMP_MRAM_SECTION] = mram_size,
+        [CORE_DUMP_REGS_SECTION] = context_size,
+    };
+    Elf32_Word flags[CORE_DUMP_NB_SECTION] = {
+        [CORE_DUMP_TEXT_SECTION] = SHF_ALLOC | SHF_EXECINSTR,
+        [CORE_DUMP_DATA_SECTION] = SHF_ALLOC | SHF_WRITE,
+        [CORE_DUMP_MRAM_SECTION] = SHF_ALLOC | SHF_WRITE,
+        [CORE_DUMP_REGS_SECTION] = SHF_ALLOC | SHF_WRITE,
+    };
+    for (unsigned int each_section = 0; each_section < CORE_DUMP_NB_SECTION; each_section++) {
+        Elf_Scn *scn = elf_newscn(elf_output_fd);
+        if (scn == NULL) {
+            elf_status = DPU_ERR_INTERNAL;
+            goto core_dump_end_elf_output_fd;
+        }
+        Elf_Data *data = elf_newdata(scn);
+        if (data == NULL) {
+            elf_status = DPU_ERR_INTERNAL;
+            goto core_dump_end_elf_output_fd;
+        }
+        shdr[each_section] = elf32_getshdr(scn);
+        if (shdr[each_section] == NULL) {
+            elf_status = DPU_ERR_INTERNAL;
+            goto core_dump_end_elf_output_fd;
+        }
+
+        data->d_buf = buffer[each_section];
+        data->d_size = buffer_size[each_section];
+        data->d_align = 4;
+        data->d_type = ELF_T_WORD;
+        data->d_off = 0LL;
+        data->d_version = EV_CURRENT;
+
+        shdr[each_section]->sh_name
+            = add_section_in_string_table(core_dump_section_to_string[each_section], &string_table, &string_table_size);
+        shdr[each_section]->sh_addr = section_addr[each_section];
+        shdr[each_section]->sh_type = SHT_PROGBITS;
+        shdr[each_section]->sh_flags = flags[each_section];
+
+        phdr[each_section].p_type = PT_LOAD;
+        phdr[each_section].p_vaddr = section_addr[each_section];
+        phdr[each_section].p_paddr = section_addr[each_section];
+        phdr[each_section].p_memsz = buffer_size[each_section];
+        phdr[each_section].p_filesz = buffer_size[each_section];
+    }
+
+    // OPEN INITAL ELF
+    dpu_elf_file_t exe_elf;
+    elf_status = dpu_elf_open(exe_path, &exe_elf);
+    if (elf_status != DPU_OK) {
+        goto core_dump_end_elf_output_fd;
+    }
+    elf_fd elf_info = (elf_fd)exe_elf;
+
+    // COPY NEEDED SECTION IN OUTPUT ELF
+    Elf32_Shdr *shdr_symtab = NULL;
+    uint32_t strtab_idx = 0;
+    for (unsigned int each_section = 1; each_section < elf_info->shnum; each_section++) {
+        Elf_Scn *scn_in = elf_getscn(elf_info->elf, each_section);
+        char *section_name;
+        elf_status = get_section_name(elf_info, scn_in, &section_name);
+        if (elf_status != DPU_OK) {
+            goto core_dump_close_exe_elf;
+        }
+        if (!section_can_be_copied(section_name)) {
+            continue;
+        }
+
+        Elf_Scn *scn_out = elf_newscn(elf_output_fd);
+        elf_status
+            = dpu_elf_copy_section(scn_out, scn_in, section_name, &string_table, &string_table_size, &shdr_symtab, &strtab_idx);
+        if (elf_status != DPU_OK) {
+            goto core_dump_close_exe_elf;
+        }
+    }
+    shdr_symtab->sh_link = strtab_idx;
+
+    // ADD SHSTRTAB SECTION IN OUTPUT ELF
     {
-        Elf_Scn *string_table_scn = elf_newscn(elf_fd);
+        Elf_Scn *string_table_scn = elf_newscn(elf_output_fd);
         if (string_table_scn == NULL) {
             elf_status = DPU_ERR_INTERNAL;
-            goto core_dump_end_elf_fd;
+            goto core_dump_close_exe_elf;
         }
         Elf_Data *data = elf_newdata(string_table_scn);
         if (data == NULL) {
             elf_status = DPU_ERR_INTERNAL;
-            goto core_dump_end_elf_fd;
+            goto core_dump_close_exe_elf;
         }
         Elf32_Shdr *shdr = elf32_getshdr(string_table_scn);
         if (shdr == NULL) {
             elf_status = DPU_ERR_INTERNAL;
-            goto core_dump_end_elf_fd;
+            goto core_dump_close_exe_elf;
         }
 
-        dpu_elf_create_section(data, shdr, &phdr[0], 0x0, (uint8_t *)string_table, sizeof(string_table), ".shstrtab");
+        shdr->sh_name = add_section_in_string_table(SHSTRTAB_SECTION_NAME, &string_table, &string_table_size);
+
+        data->d_buf = string_table;
+        data->d_size = string_table_size;
+
         ehdr->e_shstrndx = elf_ndxscn(string_table_scn);
         shdr->sh_type = SHT_STRTAB;
         shdr->sh_flags = SHF_STRINGS | SHF_ALLOC;
         shdr->sh_entsize = 0;
     }
 
-    for (unsigned int each_section = 0; each_section < nb_section; each_section++) {
-        Elf_Scn *scn = elf_newscn(elf_fd);
-        if (scn == NULL) {
-            elf_status = DPU_ERR_INTERNAL;
-            goto core_dump_end_elf_fd;
-        }
-        data[each_section] = elf_newdata(scn);
-        if (data[each_section] == NULL) {
-            elf_status = DPU_ERR_INTERNAL;
-            goto core_dump_end_elf_fd;
-        }
-        shdr[each_section] = elf32_getshdr(scn);
-        if (shdr[each_section] == NULL) {
-            elf_status = DPU_ERR_INTERNAL;
-            goto core_dump_end_elf_fd;
-        }
-
-        data[each_section]->d_align = 4;
-        data[each_section]->d_type = ELF_T_WORD;
-        data[each_section]->d_off = 0LL;
-        data[each_section]->d_version = EV_CURRENT;
-
-        phdr[each_section].p_type = PT_LOAD;
-    }
-
-    dpu_elf_create_section(data[0], shdr[0], &phdr[0], 0x80000000, iram, iram_size, ".text");
-    dpu_elf_create_section(data[1], shdr[1], &phdr[1], 0x00000000, wram, wram_size, ".data");
-    dpu_elf_create_section(data[2], shdr[2], &phdr[2], 0x08000000, mram, mram_size, ".mram");
-    dpu_elf_create_section(data[3], shdr[3], &phdr[3], 0xa0000000, context, context_size, ".regs");
-
-    {
-        Elf_Scn *strtab_scn_out = elf_newscn(elf_fd);
-        Elf_Scn *symtab_scn_out = elf_newscn(elf_fd);
-        if (strtab_scn_out == NULL || symtab_scn_out == NULL) {
-            elf_status = DPU_ERR_INTERNAL;
-            goto core_dump_end_elf_fd;
-        }
-        elf_status = dpu_elf_copy_section(strtab_scn_out, strtab_scn_in, ".strtab");
-        if (elf_status != DPU_OK)
-            goto core_dump_end_elf_fd;
-        elf_status = dpu_elf_copy_section(symtab_scn_out, symtab_scn_in, ".symtab");
-        if (elf_status != DPU_OK)
-            goto core_dump_end_elf_fd;
-    }
-
-    if (elf_update(elf_fd, ELF_C_NULL) < 0) {
+    // UPDATE ELF TO UPDATE SHDR[]->SH_OFFSET
+    if (elf_update(elf_output_fd, ELF_C_NULL) < 0) {
         elf_status = DPU_ERR_INTERNAL;
-        goto core_dump_end_elf_fd;
+        goto core_dump_close_exe_elf;
     }
 
-    for (unsigned int each_section = 0; each_section < nb_section; each_section++) {
+    // UPDATE PHDR WITH UPDATED SHDR
+    for (unsigned int each_section = 0; each_section < CORE_DUMP_NB_SECTION; each_section++) {
         phdr[each_section].p_offset = shdr[each_section]->sh_offset;
     }
 
-    if (elf_update(elf_fd, ELF_C_WRITE) < 0) {
+    // UPDATE AND WRITE IN FILE OUTPUT ELF
+    if (elf_update(elf_output_fd, ELF_C_WRITE) < 0) {
         elf_status = DPU_ERR_INTERNAL;
-        goto core_dump_end_elf_fd;
+        goto core_dump_close_exe_elf;
     }
 
-core_dump_end_elf_fd:
-    elf_end(elf_fd);
-core_dump_close_fd:
-    close(fd);
 core_dump_close_exe_elf:
     dpu_elf_close(exe_elf);
-
+core_dump_end_elf_output_fd:
+    elf_end(elf_output_fd);
+core_dump_close_fd:
+    close(fd);
+core_dump_free_string_table:
+    free(string_table);
     return elf_status;
 }

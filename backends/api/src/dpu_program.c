@@ -132,6 +132,7 @@ free_runtime_info:
 
 __API_SYMBOL__ dpu_error_t
 dpu_load_elf_program_from_memory(dpu_elf_file_t *elf_info,
+    const char *path,
     uint8_t *buffer_start,
     size_t buffer_size,
     struct dpu_program_t *program,
@@ -142,7 +143,11 @@ dpu_load_elf_program_from_memory(dpu_elf_file_t *elf_info,
         return err;
     }
 
-    program->program_path = NULL;
+    if (path != NULL) {
+        program->program_path = strdup(path);
+    } else {
+        program->program_path = NULL;
+    }
 
     return dpu_load_elf_program_from_elf_info(elf_info, program, mram_size_hint);
 }

@@ -3,5 +3,5 @@
  * found in the LICENSE file.
  */
 
-#define SEQREAD_CACHE_SIZE 64
+#define SEQREAD_CACHE_SIZE 1024
 #include <seqread.inc>

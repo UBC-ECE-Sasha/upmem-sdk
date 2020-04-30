@@ -251,12 +251,23 @@ dpu_set_dpu_iterator_next(struct dpu_set_dpu_iterator_t *iterator);
  * @param rank the targeted DPU set.
  * @param buffer the buffer where the program is stored.
  * @param buffer_size the size of the buffer
- * @param incbin the "struct dpu_incbin" created by "DPU_INCBIN".
  * @param program the DPU program information. Can be `NULL`.
  * @return Whether the operation was successful.
  */
 dpu_error_t
 dpu_load_from_memory(struct dpu_set_t dpu_set, uint8_t *buffer, size_t buffer_size, struct dpu_program_t **program);
+
+/**
+ * @fn dpu_load_from_incbin
+ * @brief Load a program from a "struct dpu_incbin" in all the DPUs of a DPU set.
+ *
+ * @param rank the targeted DPU set.
+ * @param incbin the struct created with DPU_INCBIN
+ * @param program the DPU program information. Can be `NULL`.
+ * @return Whether the operation was successful.
+ */
+dpu_error_t
+dpu_load_from_incbin(struct dpu_set_t dpu_set, struct dpu_incbin_t *incbin, struct dpu_program_t **program);
 
 /**
  * @fn dpu_load
@@ -447,7 +458,8 @@ dpu_push_xfer_symbol(struct dpu_set_t dpu_set,
     extern const void *dpu_incbin_ ## name;                                        \
     extern const void *dpu_incbin_ ## name ## _size;                               \
     struct dpu_incbin_t name = {.buffer = (uint8_t *)&dpu_incbin_ ## name ,        \
-                                .size = (size_t)&dpu_incbin_ ## name ## _size };
+                                .size = (size_t)&dpu_incbin_ ## name ## _size,     \
+                                .path = file };
 /* clang-format on */
 
 #endif // DPU_H

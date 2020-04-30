@@ -20,8 +20,6 @@
 /* All */
 #define DPU_PROFILE_PROPERTY_BACKEND "backend"
 #define DPU_PROFILE_PROPERTY_CHIP_ID "chipId"
-#define DPU_PROFILE_PROPERTY_TRY_REPAIR_IRAM "tryRepairIram"
-#define DPU_PROFILE_PROPERTY_TRY_REPAIR_WRAM "tryRepairWram"
 #define DPU_PROFILE_PROPERTY_CLOCK_DIVISION "clockDivision"
 #define DPU_PROFILE_PROPERTY_FCK_FREQUENCY "fckFrequency"
 #define DPU_PROFILE_PROPERTY_ENABLE_PROFILING                                                                                    \
@@ -38,6 +36,8 @@
 #define DPU_PROFILE_PROPERTY_DISABLED_MASK "disabledMask"
 #define DPU_PROFILE_PROPERTY_DISABLE_API_SAFE_CHECKS "disableSafeChecks"
 #define DPU_PROFILE_PROPERTY_DISABLE_MUX_SWITCH "disableMuxSwitch"
+#define DPU_PROFILE_PROPERTY_DISABLE_RESET_ON_ALLOC "disableResetOnAlloc"
+#define DPU_PROFILE_PROPERTY_DEBUG_CMDS_BUFFER_SIZE "cmdsBufferSize"
 
 /* Fsim */
 #define DPU_PROFILE_PROPERTY_NR_OF_DPUS_PER_CI "nrDpusPerCI"
@@ -75,6 +75,8 @@
 #define DPU_PROFILE_PROPERTY_HW_REGION_MODE "regionMode"
 #define DPU_PROFILE_PROPERTY_RANK_PATH "rankPath"
 #define DPU_PROFILE_PROPERTY_MODULE_COMPAT "ignoreVersion"
+#define DPU_PROFILE_PROPERTY_TRY_REPAIR_IRAM "tryRepairIram"
+#define DPU_PROFILE_PROPERTY_TRY_REPAIR_WRAM "tryRepairWram"
 
 /* Backup SPI */
 #define DPU_PROFILE_PROPERTY_BACKUP_SPI_USB_SERIAL "usbSerial"

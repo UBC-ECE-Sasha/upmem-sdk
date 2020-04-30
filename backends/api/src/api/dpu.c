@@ -18,6 +18,8 @@
 #include <dpu_internals.h>
 #include <dpu_log_utils.h>
 #include <dpu_program.h>
+#include <dpu_error.h>
+#include <dpu_types.h>
 
 static dpu_error_t
 dpu_load_rank(struct dpu_rank_t *rank, struct dpu_program_t *program, dpu_elf_file_t elf_info);
@@ -403,7 +405,7 @@ dpu_alloc(uint32_t nr_dpus, const char *profile, struct dpu_set_t *dpu_set)
                     last_rank->runtime.control_interface.slice_info[each_ci].enabled_dpus
                         = dpu_mask_unselect(enabled_dpus, each_dpu);
                     last_rank->runtime.control_interface.slice_info[each_ci].all_dpus_are_enabled = false;
-                    dpu_get(last_rank, each_ci, each_dpu)->enabled = false;
+                    DPU_GET_UNSAFE(last_rank, each_ci, each_dpu)->enabled = false;
 
                     current_nr_of_dpus--;
 
@@ -414,11 +416,12 @@ dpu_alloc(uint32_t nr_dpus, const char *profile, struct dpu_set_t *dpu_set)
             }
         }
     }
-
 reset_ranks:
     for (uint32_t each_rank = 0; each_rank < current_nr_of_ranks; ++each_rank) {
-        if ((status = dpu_reset_rank(current_ranks[each_rank])) != DPU_OK) {
-            goto free_ranks;
+        if (!current_ranks[each_rank]->description->configuration.disable_reset_on_alloc) {
+            if ((status = dpu_reset_rank(current_ranks[each_rank])) != DPU_OK) {
+                goto free_ranks;
+            }
         }
     }
 
@@ -577,13 +580,13 @@ end:
 
 static dpu_error_t
 __dpu_load_elf_program_from_incbin(dpu_elf_file_t *elf_info,
-    __attribute__((unused)) const char *path,
+    const char *path,
     uint8_t *buffer,
     size_t buffer_size,
     struct dpu_program_t *program,
     mram_size_t mram_size_hint)
 {
-    return dpu_load_elf_program_from_memory(elf_info, buffer, buffer_size, program, mram_size_hint);
+    return dpu_load_elf_program_from_memory(elf_info, path, buffer, buffer_size, program, mram_size_hint);
 }
 
 __API_SYMBOL__ dpu_error_t
@@ -592,6 +595,14 @@ dpu_load_from_memory(struct dpu_set_t dpu_set, uint8_t *buffer, size_t buffer_si
     LOG_FN(VERBOSE, "%p %lu", buffer, buffer_size);
 
     return dpu_load_generic(dpu_set, NULL, buffer, buffer_size, program, __dpu_load_elf_program_from_incbin);
+}
+
+__API_SYMBOL__ dpu_error_t
+dpu_load_from_incbin(struct dpu_set_t dpu_set, struct dpu_incbin_t *incbin, struct dpu_program_t **program)
+{
+    LOG_FN(VERBOSE, "%p %zu %s", incbin->buffer, incbin->size, incbin->path);
+
+    return dpu_load_generic(dpu_set, incbin->path, incbin->buffer, incbin->size, program, __dpu_load_elf_program_from_incbin);
 }
 
 static dpu_error_t
@@ -803,7 +814,7 @@ dpu_prepare_xfer(struct dpu_set_t dpu_set, void *buffer)
 
                 for (uint8_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
                     for (uint8_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-                        struct dpu_t *dpu = dpu_get(rank, each_ci, each_dpu);
+                        struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_ci, each_dpu);
 
                         if (!dpu_is_enabled(dpu)) {
                             continue;
@@ -968,7 +979,7 @@ dpu_load_rank(struct dpu_rank_t *rank, struct dpu_program_t *program, dpu_elf_fi
 
     for (dpu_slice_id_t each_slice = 0; each_slice < nr_of_control_interfaces; ++each_slice) {
         for (dpu_member_id_t each_dpu = 0; each_dpu < nr_of_dpus_per_control_interface; ++each_dpu) {
-            struct dpu_t *dpu = dpu_get(rank, each_slice, each_dpu);
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu);
 
             if (!dpu->enabled)
                 continue;
@@ -1255,8 +1266,8 @@ run_all_one_loop_iteration(struct dpu_rank_t *rank,
         for (dpu_slice_id_t each_ci = 0; each_ci < nr_of_control_interfaces; ++each_ci) {
             dpu_bitfield_t run_bitfield = dpu_is_running[each_ci];
             dpu_bitfield_t fault_bitfield = dpu_is_in_fault[each_ci];
-            dpu_bitfield_t stopped_bitfield = ~run_bitfield | fault_bitfield;
-            *must_stop = *must_stop && (stopped_bitfield == 0xFFFFFFFF);
+            dpu_bitfield_t stopped_bitfield = (~run_bitfield & DPU_BITFIELD_ALL) | fault_bitfield;
+            *must_stop = *must_stop && (stopped_bitfield == DPU_BITFIELD_ALL);
         }
     }
 
@@ -1328,7 +1339,7 @@ do_generic_run_all(struct dpu_rank_t *rank)
             if (at_least_one_dpu_in_fault_here) {
                 for (dpu_member_id_t each_dpu = 0; each_dpu < nr_of_dpus_per_control_interface; ++each_dpu) {
                     if (dpu_mask_is_selected(dpu_faults, each_dpu)) {
-                        dpu_print_lldb_message_on_fault(dpu_get(rank, each_ci, each_dpu), each_ci, each_dpu);
+                        dpu_print_lldb_message_on_fault(DPU_GET_UNSAFE(rank, each_ci, each_dpu), each_ci, each_dpu);
                     }
                 }
             }
@@ -1547,7 +1558,7 @@ dpu_get_common_program(struct dpu_set_t *dpu_set, struct dpu_program_t **program
 
                 for (int each_ci = 0; each_ci < nr_cis; ++each_ci) {
                     for (int each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-                        struct dpu_t *dpu = dpu_get(rank, each_ci, each_dpu);
+                        struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_ci, each_dpu);
 
                         if (!dpu_is_enabled(dpu)) {
                             continue;

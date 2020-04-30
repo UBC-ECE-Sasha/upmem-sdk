@@ -7,47 +7,29 @@ cmake_minimum_required(VERSION 3.13)
 cmake_policy(SET CMP0048 NEW)
 cmake_policy(SET CMP0063 NEW)
 
-set( CMAKE_C_VISIBILITY_PRESET default )
+set( CMAKE_C_VISIBILITY_PRESET hidden )
 
-set( SOURCE_DIRECTORY src/ )
+set( SOURCE_DIRECTORY src/ include/ )
 set( COMMONS_INCLUDE_DIRECTORIES ../commons/include/ ../commons/src/properties ../commons/src/pcb ../verbose/src
         ../commons/src ../api/include ../api/src/include)
 
-set( COMMONS_SOURCES
-        ../commons/src/properties/dpu_properties.c
-        ../commons/src/types/dpu_types.c
-        )
-
-set( UFI_SOURCES ${COMMONS_SOURCES}
-        src/dpu_operation.h
-        src/dpu_operation.c
-        src/dpu_packet.h
-        src/dpu_planner.c
-        src/dpu_query.h
-        src/dpu_query.c
-        src/dpu_transaction.h
-        src/dpu_transaction.c
-        src/list.h
-        src/dpu_commands.h
-        src/dpu_operation_type.h
-        src/dpu_operation_type_dump.c
-        src/dpu_query_constructors.c
-        src/dpu_query_constructors.h
-        src/dpu_query_parameters.h
-        src/dpu_query_parameters_dump.c
-        src/dpu_query_result_update.c
-        src/dpu_query_result_dump.c
-        src/dpu_query_target_dump.c
-        src/dpu_query_to_operations.c
-        src/dpu_query_type.h
-        src/dpu_query_type_dump.c
-        src/dpu_operation_to_command.c
+set( UFI_SOURCES
+        src/ufi_bit_config.c
+        src/ufi.c
+        src/ufi_ci.c
         )
 
 add_library( dpu-ufi SHARED ${UFI_SOURCES} )
 target_include_directories( dpu-ufi PUBLIC ${COMMONS_INCLUDE_DIRECTORIES} ${SOURCE_DIRECTORY} )
 target_link_libraries( dpu-ufi dpuverbose )
 set_target_properties(dpu-ufi PROPERTIES VERSION ${UPMEM_VERSION})
+# We want to be able to compile this with the Linux kernel rules
+target_compile_options(dpu-ufi PRIVATE
+        -std=gnu89
+        -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs -Werror-implicit-function-declaration -Wno-format-security
+        -Wno-sign-compare -Wno-unused-const-variable
+        -Wdeclaration-after-statement -Wno-pointer-sign
+        -Werror=implicit-int -Werror=strict-prototypes -Werror=date-time -Werror=incompatible-pointer-types)
 
 install(
     TARGETS dpu-ufi
@@ -55,16 +37,41 @@ install(
     DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )
 
-## TEST SUITE ##################################################################
+install(
+    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dpu
+    )
 
-if (IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
-    function(deftest testName)
-        add_executable(${testName} test/${testName}.c)
-        target_include_directories(${testName} PUBLIC src ${COMMONS_INCLUDE_DIRECTORIES} ${SOURCE_DIRECTORY} )
-        target_link_libraries(${testName} dpu-ufi dpuverbose)
-        add_test(NAME ${testName} COMMAND ${testName})
-    endfunction(deftest)
+file(GLOB_RECURSE ALL_SOURCE_FILES *.c *.h)
+list(SORT ALL_SOURCE_FILES)
 
-    deftest(basic_test)
-    deftest(dpu_command_template_test)
-endif()
+file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/.clang-format-pattern "")
+set(FIRST_SOURCE_FILE 1)
+
+foreach (SOURCE_FILE ${ALL_SOURCE_FILES})
+    string(REGEX MATCHALL "${CMAKE_CURRENT_SOURCE_DIR}(/.*)?/(target|build|CMakeFiles|(cmake-build-.*))" EXCLUDED_FILE_FOUND ${SOURCE_FILE})
+    if (NOT ${EXCLUDED_FILE_FOUND} EQUAL -1)
+        list(REMOVE_ITEM ALL_SOURCE_FILES ${SOURCE_FILE})
+    else()
+        if (FIRST_SOURCE_FILE)
+            set(FIRST_SOURCE_FILE 0)
+        else()
+            file(APPEND ${CMAKE_CURRENT_SOURCE_DIR}/.clang-format-pattern "\n")
+        endif()
+
+        STRING(REGEX REPLACE "^${CMAKE_CURRENT_SOURCE_DIR}/" "" SRC_WITHOUT_PREFIX ${SOURCE_FILE})
+        if (NOT ${SRC_WITHOUT_PREFIX} EQUAL -1)
+            file(APPEND ${CMAKE_CURRENT_SOURCE_DIR}/.clang-format-pattern "${SRC_WITHOUT_PREFIX}")
+        else()
+            file(APPEND ${CMAKE_CURRENT_SOURCE_DIR}/.clang-format-pattern "${SOURCE_FILE}")
+        endif ()
+    endif ()
+endforeach ()
+
+add_custom_target(
+        ufi-format
+        COMMAND ${CLANG_FORMAT_EXE}
+        -style=file
+        -i
+        ${ALL_SOURCE_FILES}
+)

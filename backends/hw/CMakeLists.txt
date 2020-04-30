@@ -22,6 +22,7 @@ endif()
 
 set( INCLUDE_DIRECTORIES
         ../api/include
+        ../api/src/include
         ../commons/src/properties
         ../commons/src/pcb
         ../commons/src

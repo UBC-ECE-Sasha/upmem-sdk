@@ -7,7 +7,7 @@
 #define DPU_RUNTIME_INFO_H
 
 #include <stdint.h>
-#include "dpu_elf.h"
+#include <dpu_elf.h>
 /**
  * @fn reset_runtime_info
  *

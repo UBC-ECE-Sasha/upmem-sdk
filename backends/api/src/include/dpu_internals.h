@@ -9,11 +9,21 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "dpu_error.h"
-#include "dpu_types.h"
-#include "dpu_debug.h"
+#include <dpu_error.h>
+#include <dpu_types.h>
+#include <dpu_debug.h>
 
-#include "dpu_rank.h"
+#include <dpu_rank.h>
+
+#define DPU_INDEX(rank, ci, dpu) (((rank)->description->topology.nr_of_dpus_per_control_interface * (ci)) + (dpu))
+#define DPU_GET_UNSAFE(rank, ci, dpu) ((rank)->dpus + DPU_INDEX(rank, ci, dpu))
+
+#define FF(s)                                                                                                                    \
+    do {                                                                                                                         \
+        if ((status = (s)) != DPU_OK) {                                                                                          \
+            goto end;                                                                                                            \
+        }                                                                                                                        \
+    } while (0)
 
 #define verify_thread_id(t, r)                                                                                                   \
     do {                                                                                                                         \
@@ -67,9 +77,9 @@
         }                                                                                                                        \
     } while (0)
 
-#define verify_mram_access(o, s, r)                                                                                              \
+#define verify_mram_access(p, o, s, r)                                                                                           \
     do {                                                                                                                         \
-        if (!(s)) {                                                                                                              \
+        if (((p) != NULL) && ((s) == 0)) {                                                                                       \
             LOG_RANK(WARNING, r, "WARNING: mram access of size 0 at offset %d", o);                                              \
             return DPU_OK;                                                                                                       \
         }                                                                                                                        \
@@ -86,10 +96,7 @@
     } while (0)
 
 dpu_error_t
-drain_pipeline(struct dpu_t *dpu, dpu_context_t context, dpu_pc_mode_e pc_mode, bool should_add_to_schedule);
-
-bool
-fetch_natural_pc_mode(struct dpu_rank_t *rank, dpu_pc_mode_e *pc_mode);
+drain_pipeline(struct dpu_t *dpu, dpu_context_t context, bool should_add_to_schedule);
 
 void
 set_pc_in_core_dump_or_restore_registers(dpu_thread_t thread,
@@ -109,5 +116,8 @@ from_division_factor_to_dpu_enum(uint8_t factor);
  */
 dpu_run_context_t
 dpu_get_run_context(struct dpu_rank_t *rank);
+
+dpu_error_t
+map_rank_status_to_api_status(dpu_rank_status_e rank_status);
 
 #endif /* DPU_INTERNALS_H */

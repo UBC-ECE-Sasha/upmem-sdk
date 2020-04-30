@@ -70,6 +70,8 @@ dpu_error_to_string(dpu_error_t status)
             return "no such ELF file";
         case DPU_ERR_ELF_NO_SUCH_SECTION:
             return "no such ELF section";
+        case DPU_ERR_VPD_INVALID_FILE:
+            return "invalid VPD file";
         default:
             return "unknown error";
     }

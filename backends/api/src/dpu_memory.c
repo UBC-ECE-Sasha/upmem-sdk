@@ -15,12 +15,14 @@
 #include <dpu_memory.h>
 #include <dpu_config.h>
 
-#include "dpu_rank.h"
-#include "include/dpu_internals.h"
-#include "include/dpu_api_log.h"
-#include "dpu_mask.h"
-#include "include/ufi_utils.h"
+#include <dpu_rank.h>
+#include <dpu_internals.h>
+#include <dpu_api_log.h>
+#include <dpu_mask.h>
+#include <dpu/ufi.h>
 
+static bool
+is_transfer_matrix_full(struct dpu_rank_t *rank, const struct dpu_transfer_mram *transfer_matrix);
 static bool
 is_transfer_matrix_for_debug_mram(struct dpu_rank_t *rank, const struct dpu_transfer_mram *transfer_matrix);
 static dpu_error_t
@@ -30,7 +32,7 @@ copy_to_mrams_using_dpu_program(struct dpu_rank_t *rank, const struct dpu_transf
 static dpu_error_t
 access_mram_using_dpu_program_individual(struct dpu_t *dpu,
     const struct dpu_transfer_mram *transfer,
-    dpu_transfer_type_e transfer_type,
+    dpu_transfer_type_t transfer_type,
     dpuinstruction_t *program,
     dpuinstruction_t *iram_save,
     iram_size_t nr_instructions,
@@ -38,7 +40,7 @@ access_mram_using_dpu_program_individual(struct dpu_t *dpu,
     wram_size_t wram_size);
 static dpu_error_t
 copy_mram_for_dpus(struct dpu_rank_t *rank,
-    dpu_transfer_type_e type,
+    dpu_transfer_type_t type,
     const struct dpu_transfer_mram *transfer_matrix,
     bool is_mram_debug_transfer);
 static bool
@@ -254,7 +256,7 @@ dpu_copy_to_address_matrix(struct dpu_rank_t *rank, dpu_mem_max_addr_t address, 
 
         for (uint8_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
             for (uint8_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-                struct dpu_t *dpu = dpu_get(rank, each_ci, each_dpu);
+                struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_ci, each_dpu);
 
                 if (!dpu_is_enabled(dpu)) {
                     continue;
@@ -284,7 +286,7 @@ dpu_copy_to_address_matrix(struct dpu_rank_t *rank, dpu_mem_max_addr_t address, 
 
         for (uint8_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
             for (uint8_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-                struct dpu_t *dpu = dpu_get(rank, each_ci, each_dpu);
+                struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_ci, each_dpu);
 
                 if (!dpu_is_enabled(dpu)) {
                     continue;
@@ -317,7 +319,7 @@ dpu_copy_to_address_matrix(struct dpu_rank_t *rank, dpu_mem_max_addr_t address, 
 
         for (uint8_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
             for (uint8_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-                struct dpu_t *dpu = dpu_get(rank, each_ci, each_dpu);
+                struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_ci, each_dpu);
 
                 if (!dpu_is_enabled(dpu)) {
                     continue;
@@ -392,7 +394,7 @@ dpu_copy_from_address_matrix(struct dpu_rank_t *rank, dpu_mem_max_addr_t address
 
         for (uint8_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
             for (uint8_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-                struct dpu_t *dpu = dpu_get(rank, each_ci, each_dpu);
+                struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_ci, each_dpu);
 
                 if (!dpu_is_enabled(dpu)) {
                     continue;
@@ -422,7 +424,7 @@ dpu_copy_from_address_matrix(struct dpu_rank_t *rank, dpu_mem_max_addr_t address
 
         for (uint8_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
             for (uint8_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-                struct dpu_t *dpu = dpu_get(rank, each_ci, each_dpu);
+                struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_ci, each_dpu);
 
                 if (!dpu_is_enabled(dpu)) {
                     continue;
@@ -455,7 +457,7 @@ dpu_copy_from_address_matrix(struct dpu_rank_t *rank, dpu_mem_max_addr_t address
 
         for (uint8_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
             for (uint8_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-                struct dpu_t *dpu = dpu_get(rank, each_ci, each_dpu);
+                struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_ci, each_dpu);
 
                 if (!dpu_is_enabled(dpu)) {
                     continue;
@@ -491,38 +493,16 @@ dpu_copy_to_iram_for_rank(struct dpu_rank_t *rank,
 
     verify_iram_access(iram_instruction_index, nb_of_instructions, rank);
 
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    dpu_error_t status = DPU_OK;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        return DPU_ERR_SYSTEM;
-    }
-
-    for (dpu_slice_id_t each_slice = 0; each_slice < rank->description->topology.nr_of_control_interfaces; ++each_slice) {
-        if (rank->runtime.control_interface.slice_info[each_slice].enabled_dpus == dpu_mask_empty()) {
-            continue;
-        }
-
-        build_select_query_for_all_enabled_dpus(rank, each_slice, query, transaction, status, err);
-        safe_add_query(query,
-            dpu_query_build_write_iram_instruction_for_previous(each_slice,
-                rank->runtime.control_interface.slice_info[each_slice].enabled_dpus,
-                iram_instruction_index,
-                (dpuinstruction_t *)source,
-                nb_of_instructions),
-            transaction,
-            status,
-            err);
-    }
+    dpu_error_t status;
+    uint8_t mask = ALL_CIS;
+    dpuinstruction_t *iram_array[DPU_MAX_NR_CIS] = { [0 ... DPU_MAX_NR_CIS - 1] = (dpuinstruction_t *)source };
 
     dpu_lock_rank(rank);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-    dpu_unlock_rank(rank);
+    FF(ufi_select_all(rank, &mask));
+    FF(ufi_iram_write(rank, mask, iram_array, iram_instruction_index, nb_of_instructions));
 
-err:
-    dpu_transaction_free(transaction);
+end:
+    dpu_unlock_rank(rank);
     return status;
 }
 
@@ -539,45 +519,21 @@ dpu_copy_to_iram_for_dpu(struct dpu_t *dpu,
     }
 
     struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t member_id = dpu->dpu_id;
-    dpu_error_t api_status;
-
     verify_iram_access(iram_instruction_index, nb_of_instructions, rank);
 
-    dpu_transaction_t transaction;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL)
-        return DPU_ERR_SYSTEM;
-
-    dpu_query_t query;
-
-    if ((query = dpu_query_build_select_dpu_for_control(slice_id, member_id)) == NULL) {
-        api_status = DPU_ERR_SYSTEM;
-        goto err_free;
-    }
-
-    dpu_transaction_add_query_tail(transaction, query);
-
-    if ((query = dpu_query_build_write_iram_instruction_for_previous(
-             slice_id, dpu_mask_one(member_id), iram_instruction_index, (dpuinstruction_t *)source, nb_of_instructions))
-        == NULL) {
-        api_status = DPU_ERR_SYSTEM;
-        goto err_free;
-    }
-
-    dpu_transaction_add_query_tail(transaction, query);
+    dpu_error_t status;
+    dpu_slice_id_t slice_id = dpu->slice_id;
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    dpuinstruction_t *iram_array[DPU_MAX_NR_CIS];
+    iram_array[slice_id] = (dpuinstruction_t *)source;
 
     dpu_lock_rank(rank);
-    dpu_planner_status_e status = dpu_planner_execute_transaction(transaction, rank->handler_context->handler, rank);
+    FF(ufi_select_dpu(rank, &mask, dpu->dpu_id));
+    FF(ufi_iram_write(rank, mask, iram_array, iram_instruction_index, nb_of_instructions));
+
+end:
     dpu_unlock_rank(rank);
-
-    api_status = map_planner_status_to_api_status(status);
-
-err_free:
-    dpu_transaction_free(transaction);
-
-    return api_status;
+    return status;
 }
 
 __PERF_PROFILING_SYMBOL__ __API_SYMBOL__ dpu_error_t
@@ -593,42 +549,21 @@ dpu_copy_from_iram_for_dpu(struct dpu_t *dpu,
     }
 
     struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t member_id = dpu->dpu_id;
-
     verify_iram_access(iram_instruction_index, nb_of_instructions, rank);
 
-    dpu_transaction_t transaction;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_query_t query;
-
-    if ((query = dpu_query_build_select_dpu_for_control(slice_id, member_id)) == NULL) {
-        dpu_transaction_free(transaction);
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_transaction_add_query_tail(transaction, query);
-
-    if ((query = dpu_query_build_read_iram_instruction_for_previous(
-             slice_id, iram_instruction_index, nb_of_instructions, destination))
-        == NULL) {
-        dpu_transaction_free(transaction);
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_transaction_add_query_tail(transaction, query);
+    dpu_error_t status;
+    dpu_slice_id_t slice_id = dpu->slice_id;
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    dpuinstruction_t *iram_array[DPU_MAX_NR_CIS];
+    iram_array[slice_id] = destination;
 
     dpu_lock_rank(rank);
-    dpu_planner_status_e status = dpu_planner_execute_transaction(transaction, rank->handler_context->handler, rank);
+    FF(ufi_select_dpu(rank, &mask, dpu->dpu_id));
+    FF(ufi_iram_read(rank, mask, iram_array, iram_instruction_index, nb_of_instructions));
+
+end:
     dpu_unlock_rank(rank);
-
-    dpu_transaction_free(transaction);
-
-    return map_planner_status_to_api_status(status);
+    return status;
 }
 
 __PERF_PROFILING_SYMBOL__ __API_SYMBOL__ dpu_error_t
@@ -637,39 +572,16 @@ dpu_copy_to_wram_for_rank(struct dpu_rank_t *rank, wram_addr_t wram_word_offset,
     LOG_RANK(VERBOSE, rank, "%u, %u", wram_word_offset, nb_of_words);
 
     verify_wram_access(wram_word_offset, nb_of_words, rank);
-
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    dpu_error_t status = DPU_OK;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        return DPU_ERR_SYSTEM;
-    }
-
-    for (dpu_slice_id_t each_slice = 0; each_slice < rank->description->topology.nr_of_control_interfaces; ++each_slice) {
-        if (rank->runtime.control_interface.slice_info[each_slice].enabled_dpus == dpu_mask_empty()) {
-            continue;
-        }
-
-        build_select_query_for_all_enabled_dpus(rank, each_slice, query, transaction, status, err);
-        safe_add_query(query,
-            dpu_query_build_write_wram_word_for_previous(each_slice,
-                rank->runtime.control_interface.slice_info[each_slice].enabled_dpus,
-                wram_word_offset,
-                (dpuword_t *)source,
-                nb_of_words),
-            transaction,
-            status,
-            err);
-    }
+    dpu_error_t status;
+    uint8_t mask = ALL_CIS;
+    dpuword_t *wram_array[DPU_MAX_NR_CIS] = { [0 ... DPU_MAX_NR_CIS - 1] = (dpuword_t *)source };
 
     dpu_lock_rank(rank);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-    dpu_unlock_rank(rank);
+    FF(ufi_select_all(rank, &mask));
+    FF(ufi_wram_write(rank, mask, wram_array, wram_word_offset, nb_of_words));
 
-err:
-    dpu_transaction_free(transaction);
+end:
+    dpu_unlock_rank(rank);
     return status;
 }
 
@@ -683,41 +595,21 @@ dpu_copy_to_wram_for_dpu(struct dpu_t *dpu, wram_addr_t wram_word_offset, const 
     }
 
     struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t member_id = dpu->dpu_id;
     verify_wram_access(wram_word_offset, nb_of_words, rank);
 
-    dpu_transaction_t transaction;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_query_t query;
-
-    if ((query = dpu_query_build_select_dpu_for_control(slice_id, member_id)) == NULL) {
-        dpu_transaction_free(transaction);
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_transaction_add_query_tail(transaction, query);
-
-    if ((query = dpu_query_build_write_wram_word_for_previous(
-             slice_id, dpu_mask_one(member_id), wram_word_offset, (dpuword_t *)source, nb_of_words))
-        == NULL) {
-        dpu_transaction_free(transaction);
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_transaction_add_query_tail(transaction, query);
+    dpu_error_t status;
+    dpu_slice_id_t slice_id = dpu->slice_id;
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    dpuword_t *wram_array[DPU_MAX_NR_CIS];
+    wram_array[slice_id] = (dpuword_t *)source;
 
     dpu_lock_rank(rank);
-    dpu_planner_status_e status = dpu_planner_execute_transaction(transaction, rank->handler_context->handler, rank);
+    FF(ufi_select_dpu(rank, &mask, dpu->dpu_id));
+    FF(ufi_wram_write(rank, mask, wram_array, wram_word_offset, nb_of_words));
+
+end:
     dpu_unlock_rank(rank);
-
-    dpu_transaction_free(transaction);
-
-    return map_planner_status_to_api_status(status);
+    return status;
 }
 
 __PERF_PROFILING_SYMBOL__ __API_SYMBOL__ dpu_error_t
@@ -730,39 +622,21 @@ dpu_copy_from_wram_for_dpu(struct dpu_t *dpu, dpuword_t *destination, wram_addr_
     }
 
     struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t member_id = dpu->dpu_id;
     verify_wram_access(wram_word_offset, nb_of_words, rank);
 
-    dpu_transaction_t transaction;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_query_t query;
-
-    if ((query = dpu_query_build_select_dpu_for_control(slice_id, member_id)) == NULL) {
-        dpu_transaction_free(transaction);
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_transaction_add_query_tail(transaction, query);
-
-    if ((query = dpu_query_build_read_wram_word_for_previous(slice_id, wram_word_offset, nb_of_words, destination)) == NULL) {
-        dpu_transaction_free(transaction);
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_transaction_add_query_tail(transaction, query);
+    dpu_error_t status;
+    dpu_slice_id_t slice_id = dpu->slice_id;
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    dpuword_t *wram_array[DPU_MAX_NR_CIS];
+    wram_array[slice_id] = destination;
 
     dpu_lock_rank(rank);
-    dpu_planner_status_e status = dpu_planner_execute_transaction(transaction, rank->handler_context->handler, rank);
+    FF(ufi_select_dpu(rank, &mask, dpu->dpu_id));
+    FF(ufi_wram_read(rank, mask, wram_array, wram_word_offset, nb_of_words));
+
+end:
     dpu_unlock_rank(rank);
-
-    dpu_transaction_free(transaction);
-
-    return map_planner_status_to_api_status(status);
+    return status;
 }
 
 __API_SYMBOL__ dpu_error_t
@@ -956,7 +830,7 @@ dpu_transfer_matrix_add_dpu(struct dpu_t *dpu,
     struct dpu_rank_t *rank = dpu_get_rank(dpu);
     uint32_t offset = offset_in_mram & ~MRAM_MASK;
 
-    verify_mram_access(offset, size, rank);
+    verify_mram_access(buffer, offset, size, rank);
 
     if (!dpu->enabled) {
         return DPU_ERR_DPU_DISABLED;
@@ -986,7 +860,7 @@ dpu_transfer_matrix_set_all(struct dpu_rank_t *rank,
 
     for (dpu_slice_id_t each_ci = 0; each_ci < nr_of_cis; ++each_ci) {
         for (dpu_member_id_t each_dpu = 0; each_dpu < nr_of_dpus_per_ci; ++each_dpu) {
-            struct dpu_t *dpu = dpu_get(rank, each_ci, each_dpu);
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_ci, each_dpu);
 
             if (dpu->enabled) {
                 dpu_transfer_matrix_add_dpu(dpu, transfer_matrix, buffer, size, offset_in_mram, mram_number);
@@ -1083,7 +957,7 @@ copy_from_mrams_using_dpu_program(struct dpu_rank_t *rank, const struct dpu_tran
                 continue;
             }
 
-            struct dpu_t *dpu = dpu_get(rank, slice_id, dpu_id);
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, slice_id, dpu_id);
 
             if (!dpu->enabled) {
                 continue;
@@ -1193,7 +1067,7 @@ copy_to_mrams_using_dpu_program(struct dpu_rank_t *rank, const struct dpu_transf
                 continue;
             }
 
-            struct dpu_t *dpu = dpu_get(rank, slice_id, dpu_id);
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, slice_id, dpu_id);
 
             if (!dpu->enabled) {
                 continue;
@@ -1314,68 +1188,77 @@ free_buffer:
 }
 
 static dpu_error_t
+do_mram_transfer(struct dpu_rank_t *rank, dpu_transfer_type_t type, struct dpu_transfer_mram *matrix)
+{
+    LOG_RANK(VERBOSE, rank, "");
+
+    dpu_error_t status = DPU_OK;
+    dpu_rank_handler_t handler = rank->handler_context->handler;
+
+    switch (type) {
+        case DPU_TRANSFER_FROM_MRAM:
+            if (handler->copy_from_rank(rank, matrix) != DPU_RANK_SUCCESS) {
+                status = DPU_ERR_DRIVER;
+            }
+            break;
+        case DPU_TRANSFER_TO_MRAM:
+            if (handler->copy_to_rank(rank, matrix) != DPU_RANK_SUCCESS) {
+                status = DPU_ERR_DRIVER;
+            }
+            break;
+
+        default:
+            status = DPU_ERR_INTERNAL;
+            break;
+    }
+
+    return status;
+}
+
+static dpu_error_t
 copy_mram_for_dpus(struct dpu_rank_t *rank,
-    dpu_transfer_type_e type,
+    dpu_transfer_type_t type,
     const struct dpu_transfer_mram *transfer_matrix,
     bool is_mram_debug_transfer)
 {
     LOG_RANK(VERBOSE, rank, "");
-    dpu_planner_status_e planner_status;
-    dpu_error_t status = DPU_OK;
+    dpu_error_t status;
     struct dpu_transfer_mram *even_transfer_matrix = NULL, *odd_transfer_matrix = NULL;
     bool is_duplication_needed = false;
 
-    if (!is_mram_debug_transfer)
+    if (!is_mram_debug_transfer) {
         is_duplication_needed = duplicate_transfer_matrix(rank, transfer_matrix, &even_transfer_matrix, &odd_transfer_matrix);
+    }
 
-    if (is_duplication_needed == false) {
+    if (!is_duplication_needed) {
+        bool is_full_matrix = is_transfer_matrix_full(rank, transfer_matrix);
+
         if (!is_mram_debug_transfer) {
-            status = host_get_access_for_transfer_matrix(rank, transfer_matrix);
-            if (status != DPU_OK)
-                return status;
+            if (is_full_matrix)
+                FF(dpu_host_get_access_for_rank(rank));
+            else
+                FF(host_get_access_for_transfer_matrix(rank, transfer_matrix));
         }
 
-        planner_status = dpu_planner_execute_transfer(
-            rank->handler_context->handler, rank, type, (struct dpu_transfer_mram *)transfer_matrix);
-        if (planner_status != DPU_PLANNER_SUCCESS) {
-            status = map_planner_status_to_api_status(planner_status);
-            return status;
+        FF(do_mram_transfer(rank, type, (struct dpu_transfer_mram *)transfer_matrix));
+
+        if (!is_mram_debug_transfer) {
+            if (is_full_matrix)
+                FF(dpu_host_release_access_for_rank(rank));
+            else
+                FF(host_release_access_for_transfer_matrix(rank, transfer_matrix));
         }
     } else {
-        status = host_get_access_for_transfer_matrix(rank, even_transfer_matrix);
-        if (status != DPU_OK)
-            goto err_even_odd;
+        FF(host_get_access_for_transfer_matrix(rank, even_transfer_matrix));
+        FF(do_mram_transfer(rank, type, even_transfer_matrix));
 
-        planner_status = dpu_planner_execute_transfer(rank->handler_context->handler, rank, type, even_transfer_matrix);
-        if (planner_status != DPU_PLANNER_SUCCESS) {
+        FF(host_get_access_for_transfer_matrix(rank, odd_transfer_matrix));
+        FF(do_mram_transfer(rank, type, odd_transfer_matrix));
 
-            status = map_planner_status_to_api_status(planner_status);
-            goto err_even_odd;
-        }
-
-        status = host_get_access_for_transfer_matrix(rank, odd_transfer_matrix);
-        if (status != DPU_OK)
-            goto err_even_odd;
-
-        planner_status = dpu_planner_execute_transfer(rank->handler_context->handler, rank, type, odd_transfer_matrix);
-        if (planner_status != DPU_PLANNER_SUCCESS) {
-            status = map_planner_status_to_api_status(planner_status);
-            goto err_even_odd;
-        }
-
-        free(even_transfer_matrix);
-        free(odd_transfer_matrix);
+        FF(host_release_access_for_transfer_matrix(rank, transfer_matrix));
     }
 
-    if (!is_mram_debug_transfer) {
-        status = host_release_access_for_transfer_matrix(rank, transfer_matrix);
-        if (status != DPU_OK)
-            return status;
-    }
-
-    return status;
-
-err_even_odd:
+end:
     free(even_transfer_matrix);
     free(odd_transfer_matrix);
 
@@ -1385,7 +1268,7 @@ err_even_odd:
 static dpu_error_t
 access_mram_using_dpu_program_individual(struct dpu_t *dpu,
     const struct dpu_transfer_mram *transfer,
-    dpu_transfer_type_e transfer_type,
+    dpu_transfer_type_t transfer_type,
     dpuinstruction_t *program,
     dpuinstruction_t *iram_save,
     iram_size_t nr_instructions,
@@ -1411,16 +1294,11 @@ access_mram_using_dpu_program_individual(struct dpu_t *dpu,
 
     uint8_t nr_mrams = (rank->description->memories.dbg_mram_size == 0) ? 1 : 2;
     dpu_selected_mask_t mask_one = dpu_mask_one(dpu_id);
-    uint32_t bitfield_result;
-    dpu_planner_status_e planner_status;
     uint32_t ptr_offset;
 
-    if (transfer->size == 0) {
-        goto end;
-    }
+    dpu_lock_rank(rank);
 
-    if ((status = dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_START, (dpu_custom_command_args_t)DPU_EVENT_MRAM_ACCESS_PROGRAM))
-        != DPU_OK) {
+    if (transfer->size == 0) {
         goto end;
     }
 
@@ -1428,6 +1306,8 @@ access_mram_using_dpu_program_individual(struct dpu_t *dpu,
         status = DPU_ERR_INVALID_MRAM_ACCESS;
         goto end;
     }
+
+    FF(dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_START, (dpu_custom_command_args_t)DPU_EVENT_MRAM_ACCESS_PROGRAM));
 
 #define DMA_ACCESS_IDX_1 11
 #define DMA_ACCESS_IDX_2 19
@@ -1469,81 +1349,42 @@ access_mram_using_dpu_program_individual(struct dpu_t *dpu,
         wram_save_size = (transfer->size / sizeof(dpuword_t)) + PROGRAM_CONTEXT_WRAM_SIZE;
     }
 
-    dpu_transaction_t transaction;
-    dpu_transaction_t polling_transaction;
-    dpu_transaction_t wram_access_transaction;
-    dpu_query_t query;
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    FF(ufi_select_dpu(rank, &mask, dpu_id));
 
-    if ((wram_access_transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
-
-    if ((polling_transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto free_wram_transaction;
-    }
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto free_polling_transaction;
-    }
-
-    // Fetching PC for thread 0 and patching program
-
-    dpu_pc_mode_e pc_mode;
-
-    if (!fetch_natural_pc_mode(rank, &pc_mode)) {
-        status = DPU_ERR_INTERNAL;
-        goto free_transaction;
-    }
-    safe_add_query(query, dpu_query_build_select_dpu_for_control(slice_id, dpu_id), transaction, status, free_transaction);
     // Interception Fault Set
-    safe_add_query(
-        query, dpu_query_build_set_and_step_dpu_fault_state_for_previous(slice_id), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_set_bkp_fault_for_previous(slice_id), transaction, status, free_transaction);
-
-    safe_add_query(
-        query, dpu_query_build_resume_thread_for_previous(slice_id, 0, &bitfield_result), transaction, status, free_transaction);
+    FF(ufi_set_dpu_fault_and_step(rank, mask));
+    FF(ufi_set_bkp_fault(rank, mask));
+    FF(ufi_thread_resume(rank, mask, 0, NULL));
     // Interception Fault Clear
-    safe_add_query(
-        query, dpu_query_build_read_bkp_fault_for_previous(slice_id, &bitfield_result), transaction, status, free_transaction);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    FF(ufi_read_bkp_fault(rank, mask, NULL));
 
     iram_addr_t thread_0_pc;
     struct _dpu_context_t context;
     context.pcs = &thread_0_pc;
 
     // Draining the pipeline
-    drain_pipeline(dpu, &context, pc_mode, false);
+    drain_pipeline(dpu, &context, false);
 
     // Clear fault
-    safe_add_query(query, dpu_query_build_clear_bkp_fault_for_previous(slice_id), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_clear_dpu_fault_state_for_previous(slice_id), transaction, status, free_transaction);
+    FF(ufi_select_dpu(rank, &mask, dpu_id));
+    FF(ufi_clear_fault_bkp(rank, mask));
+    FF(ufi_clear_fault_dpu(rank, mask));
 
     set_pc_in_core_dump_or_restore_registers(0, thread_0_pc, program, nr_instructions, 1);
 
+    dpuinstruction_t *iram_array[DPU_MAX_NR_CIS];
+    dpuword_t *wram_array[DPU_MAX_NR_CIS];
+
     // Saving IRAM
-    safe_add_query(query,
-        dpu_query_build_read_iram_instruction_for_previous(slice_id, 0, nr_instructions, iram_save),
-        transaction,
-        status,
-        free_transaction);
+    iram_array[slice_id] = iram_save;
+    FF(ufi_iram_read(rank, mask, iram_array, 0, nr_instructions));
     // Saving WRAM
-    safe_add_query(query,
-        dpu_query_build_read_wram_word_for_previous(slice_id, 0, wram_save_size, wram_save),
-        transaction,
-        status,
-        free_transaction);
+    wram_array[slice_id] = wram_save;
+    FF(ufi_wram_read(rank, mask, wram_array, 0, wram_save_size));
     // Loading DPU program in IRAM
-    safe_add_query(query,
-        dpu_query_build_write_iram_instruction_for_previous(slice_id, mask_one, 0, program, nr_instructions),
-        transaction,
-        status,
-        free_transaction);
+    iram_array[slice_id] = program;
+    FF(ufi_iram_write(rank, mask, iram_array, 0, nr_instructions));
 
     wram_size_t transfer_size = wram_save_size - PROGRAM_CONTEXT_WRAM_SIZE;
     wram_addr_t transfer_start = PROGRAM_CONTEXT_WRAM_SIZE;
@@ -1558,99 +1399,52 @@ access_mram_using_dpu_program_individual(struct dpu_t *dpu,
         transfer_size * sizeof(dpuword_t), // Buffer size
         ((nr_complete_iterations == 0) || ((nr_complete_iterations == 1) && (remaining == 0))) ? 1 : 0 // Last transfer marker
     };
-    safe_add_query(query,
-        dpu_query_build_write_wram_word_for_previous(slice_id, mask_one, 5, program_context, 3),
-        transaction,
-        status,
-        free_transaction);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    safe_add_query(
-        query, dpu_query_build_boot_thread_for_previous(slice_id, 0, &bitfield_result), transaction, status, free_transaction);
-
+    wram_array[slice_id] = program_context;
+    FF(ufi_wram_write(rank, mask, wram_array, 5, 3));
     if (transfer_type == DPU_TRANSFER_TO_MRAM) {
         // Loading WRAM
-        safe_add_query(query,
-            dpu_query_build_write_wram_word_for_previous(slice_id, mask_one, transfer_start, transfer->ptr, transfer_size),
-            wram_access_transaction,
-            status,
-            free_transaction);
-        safe_execute_transaction(wram_access_transaction, rank, planner_status, status, free_transaction);
+        wram_array[slice_id] = transfer->ptr;
+        FF(ufi_wram_write(rank, mask, wram_array, transfer_start, transfer_size));
     }
-
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-    safe_add_query(query,
-        dpu_query_build_read_dpu_run_state_for_previous(slice_id, &bitfield_result),
-        polling_transaction,
-        status,
-        free_transaction);
+    FF(ufi_thread_boot(rank, mask, 0, NULL));
 
     // Polling
+    dpu_bitfield_t running[DPU_MAX_NR_CIS];
     do {
-        safe_execute_transaction(polling_transaction, rank, planner_status, status, free_transaction);
-    } while ((bitfield_result & mask_one) != 0);
+        FF(ufi_read_dpu_run(rank, mask, running));
+    } while ((running[slice_id] & mask_one) != 0);
 
     if (transfer_type == DPU_TRANSFER_FROM_MRAM) {
         // Fetching WRAM
-        safe_add_query(query,
-            dpu_query_build_read_wram_word_for_previous(slice_id, transfer_start, transfer_size, transfer->ptr),
-            wram_access_transaction,
-            status,
-            free_transaction);
-        safe_execute_transaction(wram_access_transaction, rank, planner_status, status, free_transaction);
+        wram_array[slice_id] = transfer->ptr;
+        FF(ufi_wram_read(rank, mask, wram_array, transfer_start, transfer_size));
     }
     ptr_offset = transfer_size * sizeof(dpuword_t);
-
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    safe_add_query(
-        query, dpu_query_build_resume_thread_for_previous(slice_id, 0, &bitfield_result), transaction, status, free_transaction);
 
     for (uint32_t each_iteration = 1; each_iteration < nr_complete_iterations; ++each_iteration) {
         if (transfer_type == DPU_TRANSFER_TO_MRAM) {
             // Loading WRAM
-            dpu_transaction_free_queries_for_slice(wram_access_transaction, slice_id);
-            safe_add_query(query,
-                dpu_query_build_write_wram_word_for_previous(
-                    slice_id, mask_one, transfer_start, transfer->ptr + ptr_offset, transfer_size),
-                wram_access_transaction,
-                status,
-                free_transaction);
-            safe_execute_transaction(wram_access_transaction, rank, planner_status, status, free_transaction);
+            wram_array[slice_id] = transfer->ptr + ptr_offset;
+            FF(ufi_wram_write(rank, mask, wram_array, transfer_start, transfer_size));
         }
 
         if ((each_iteration == (nr_complete_iterations - 1)) && (remaining == 0)) {
             dpuword_t last_transfer_marker = 1;
-
-            dpu_transaction_free_queries_for_slice(wram_access_transaction, slice_id);
-            safe_add_query(query,
-                dpu_query_build_write_wram_word_for_previous(slice_id, mask_one, 7, &last_transfer_marker, 1),
-                wram_access_transaction,
-                status,
-                free_transaction);
-            safe_execute_transaction(wram_access_transaction, rank, planner_status, status, free_transaction);
+            wram_array[slice_id] = &last_transfer_marker;
+            FF(ufi_wram_write(rank, mask, wram_array, 7, 1));
         }
 
-        safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
+        FF(ufi_thread_resume(rank, mask, 0, NULL));
 
         // Polling
         do {
-            safe_execute_transaction(polling_transaction, rank, planner_status, status, free_transaction);
-        } while ((bitfield_result & mask_one) != 0);
+            FF(ufi_read_dpu_run(rank, mask, running));
+        } while ((running[slice_id] & mask_one) != 0);
 
         if (transfer_type == DPU_TRANSFER_FROM_MRAM) {
             // Fetching WRAM
-            dpu_transaction_free_queries_for_slice(wram_access_transaction, slice_id);
-            safe_add_query(query,
-                dpu_query_build_read_wram_word_for_previous(slice_id, transfer_start, transfer_size, transfer->ptr + ptr_offset),
-                wram_access_transaction,
-                status,
-                free_transaction);
-            safe_execute_transaction(wram_access_transaction, rank, planner_status, status, free_transaction);
+            wram_array[slice_id] = transfer->ptr + ptr_offset;
+            FF(ufi_wram_read(rank, mask, wram_array, transfer_start, transfer_size));
         }
         ptr_offset += transfer_size * sizeof(dpuword_t);
     }
@@ -1662,80 +1456,68 @@ access_mram_using_dpu_program_individual(struct dpu_t *dpu,
             program_context[1] = remaining;
             program_context[2] = 1;
 
-            dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-            safe_add_query(query,
-                dpu_query_build_write_wram_word_for_previous(slice_id, mask_one, 6, program_context + 1, 2),
-                transaction,
-                status,
-                free_transaction);
-            safe_add_query(query,
-                dpu_query_build_resume_thread_for_previous(slice_id, 0, &bitfield_result),
-                transaction,
-                status,
-                free_transaction);
+            wram_array[slice_id] = program_context + 1;
+            FF(ufi_wram_write(rank, mask, wram_array, 6, 2));
 
             if (transfer_type == DPU_TRANSFER_TO_MRAM) {
                 // Loading WRAM
-                dpu_transaction_free_queries_for_slice(wram_access_transaction, slice_id);
-                safe_add_query(query,
-                    dpu_query_build_write_wram_word_for_previous(
-                        slice_id, mask_one, transfer_start, transfer->ptr + ptr_offset, transfer_size),
-                    wram_access_transaction,
-                    status,
-                    free_transaction);
-                safe_execute_transaction(wram_access_transaction, rank, planner_status, status, free_transaction);
+                wram_array[slice_id] = transfer->ptr + ptr_offset;
+                FF(ufi_wram_write(rank, mask, wram_array, transfer_start, transfer_size));
             }
 
-            safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-            dpu_transaction_free_queries_for_slice(wram_access_transaction, slice_id);
+            FF(ufi_thread_resume(rank, mask, 0, NULL));
 
             // Polling
             do {
-                safe_execute_transaction(polling_transaction, rank, planner_status, status, free_transaction);
-            } while ((bitfield_result & mask_one) != 0);
+                FF(ufi_read_dpu_run(rank, mask, running));
+            } while ((running[slice_id] & mask_one) != 0);
 
             if (transfer_type == DPU_TRANSFER_FROM_MRAM) {
                 // Fetching WRAM
-                safe_add_query(query,
-                    dpu_query_build_read_wram_word_for_previous(
-                        slice_id, transfer_start, transfer_size, transfer->ptr + ptr_offset),
-                    wram_access_transaction,
-                    status,
-                    free_transaction);
-                safe_execute_transaction(wram_access_transaction, rank, planner_status, status, free_transaction);
+                wram_array[slice_id] = transfer->ptr + ptr_offset;
+                FF(ufi_wram_read(rank, mask, wram_array, transfer_start, transfer_size));
             }
         }
     }
 
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
     // Restoring IRAM
-    safe_add_query(query,
-        dpu_query_build_write_iram_instruction_for_previous(slice_id, mask_one, 0, iram_save, nr_instructions),
-        transaction,
-        status,
-        free_transaction);
+    iram_array[slice_id] = iram_save;
+    FF(ufi_iram_write(rank, mask, iram_array, 0, nr_instructions));
     // Restoring WRAM
-    safe_add_query(query,
-        dpu_query_build_write_wram_word_for_previous(slice_id, mask_one, 0, wram_save, wram_save_size),
-        transaction,
-        status,
-        free_transaction);
+    wram_array[slice_id] = wram_save;
+    FF(ufi_wram_write(rank, mask, wram_array, 0, wram_save_size));
 
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
+    FF(dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_END, (dpu_custom_command_args_t)DPU_EVENT_MRAM_ACCESS_PROGRAM));
 
-    status = dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_END, (dpu_custom_command_args_t)DPU_EVENT_MRAM_ACCESS_PROGRAM);
-
-free_transaction:
-    dpu_transaction_free(transaction);
-free_polling_transaction:
-    dpu_transaction_free(polling_transaction);
-free_wram_transaction:
-    dpu_transaction_free(wram_access_transaction);
 end:
+    dpu_unlock_rank(rank);
     return status;
+}
+
+static bool
+is_transfer_matrix_full(struct dpu_rank_t *rank, const struct dpu_transfer_mram *transfer_matrix)
+{
+    LOG_RANK(VERBOSE, rank, "%p", transfer_matrix);
+
+    uint8_t nr_of_dpus_per_ci = rank->description->topology.nr_of_dpus_per_control_interface;
+    uint8_t nr_of_cis = rank->description->topology.nr_of_control_interfaces;
+
+    for (uint8_t each_slice = 0; each_slice < nr_of_cis; ++each_slice) {
+        dpu_selected_mask_t enabled_dpus = rank->runtime.control_interface.slice_info[each_slice].enabled_dpus;
+
+        for (uint8_t each_dpu = 0; each_dpu < nr_of_dpus_per_ci; ++each_dpu) {
+            if (!dpu_mask_is_selected(enabled_dpus, each_dpu))
+                continue;
+
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu);
+            int idx = _transfer_matrix_index(dpu);
+
+            if (!transfer_matrix[idx].ptr)
+                return false;
+        }
+    }
+
+    return true;
 }
 
 static bool
@@ -1748,7 +1530,7 @@ is_transfer_matrix_for_debug_mram(struct dpu_rank_t *rank, const struct dpu_tran
 
     for (uint8_t each_slice = 0; each_slice < nr_of_cis; ++each_slice) {
         for (uint8_t each_dpu = 0; each_dpu < nr_of_dpus_per_ci; ++each_dpu) {
-            struct dpu_t *dpu = dpu_get(rank, each_slice, each_dpu);
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu);
             int idx = _transfer_matrix_index(dpu);
 
             if (transfer_matrix[idx].ptr && transfer_matrix[idx].mram_number != DPU_DEBUG_MRAM)
@@ -1824,8 +1606,8 @@ duplicate_transfer_matrix(struct dpu_rank_t *rank,
              each_dpu += 2) {
             for (dpu_slice_id_t each_slice = 0; each_slice < rank->description->topology.nr_of_control_interfaces; ++each_slice) {
                 int idx_dpu_first, idx_dpu_second;
-                struct dpu_t *first_dpu = dpu_get(rank, each_slice, each_dpu);
-                struct dpu_t *second_dpu = dpu_get(rank, each_slice, each_dpu + 1);
+                struct dpu_t *first_dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu);
+                struct dpu_t *second_dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu + 1);
 
                 idx_dpu_first = _transfer_matrix_index(first_dpu);
                 idx_dpu_second = _transfer_matrix_index(second_dpu);
@@ -1867,8 +1649,8 @@ duplicate_transfer_matrix(struct dpu_rank_t *rank,
                  each_dpu += 2) {
                 for (dpu_slice_id_t each_slice = 0; each_slice < rank->description->topology.nr_of_control_interfaces;
                      ++each_slice) {
-                    struct dpu_t *first_dpu = dpu_get(rank, each_slice, each_dpu);
-                    struct dpu_t *second_dpu = dpu_get(rank, each_slice, each_dpu + 1);
+                    struct dpu_t *first_dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu);
+                    struct dpu_t *second_dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu + 1);
 
                     int first_dpu_idx = _transfer_matrix_index(first_dpu);
                     int second_dpu_idx = _transfer_matrix_index(second_dpu);
@@ -1902,13 +1684,13 @@ host_get_access_for_transfer_matrix(struct dpu_rank_t *rank, const struct dpu_tr
     for (dpu_slice_id_t each_slice = 0; each_slice < rank->description->topology.nr_of_control_interfaces; ++each_slice) {
         for (dpu_member_id_t each_dpu = 0; each_dpu < rank->description->topology.nr_of_dpus_per_control_interface;
              each_dpu += 2) {
-            struct dpu_t *first_dpu = dpu_get(rank, each_slice, each_dpu);
+            struct dpu_t *first_dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu);
             int idx_dpu_first = _transfer_matrix_index(first_dpu);
 
             bool transfer_present = transfer_matrix[idx_dpu_first].ptr != NULL;
 
             if (each_dpu + 1 < rank->description->topology.nr_of_dpus_per_control_interface) {
-                struct dpu_t *second_dpu = dpu_get(rank, each_slice, each_dpu + 1);
+                struct dpu_t *second_dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu + 1);
                 int idx_dpu_second = _transfer_matrix_index(second_dpu);
                 transfer_present = transfer_present || transfer_matrix[idx_dpu_second].ptr != NULL;
             }
@@ -1932,13 +1714,13 @@ host_release_access_for_transfer_matrix(struct dpu_rank_t *rank, const struct dp
     for (dpu_slice_id_t each_slice = 0; each_slice < rank->description->topology.nr_of_control_interfaces; ++each_slice) {
         for (dpu_member_id_t each_dpu = 0; each_dpu < rank->description->topology.nr_of_dpus_per_control_interface;
              each_dpu += 2) {
-            struct dpu_t *first_dpu = dpu_get(rank, each_slice, each_dpu);
+            struct dpu_t *first_dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu);
             int idx_dpu_first = _transfer_matrix_index(first_dpu);
 
             bool transfer_present = transfer_matrix[idx_dpu_first].ptr != NULL;
 
             if (each_dpu + 1 < rank->description->topology.nr_of_dpus_per_control_interface) {
-                struct dpu_t *second_dpu = dpu_get(rank, each_slice, each_dpu + 1);
+                struct dpu_t *second_dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu + 1);
                 int idx_dpu_second = _transfer_matrix_index(second_dpu);
                 transfer_present = transfer_present || transfer_matrix[idx_dpu_second].ptr != NULL;
             }

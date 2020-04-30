@@ -1,0 +1,9 @@
+include/dpu/ufi.h
+include/dpu/ufi_bit_config.h
+include/dpu/ufi_ci.h
+include/dpu/ufi_ci_commands.h
+include/dpu/ufi_ci_types.h
+src/ufi.c
+src/ufi_bit_config.c
+src/ufi_ci.c
+src/ufi_rank_utils.h

@@ -14,6 +14,12 @@ endif()
 
 project(backends VERSION ${UPMEM_VERSION})
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+execute_process(
+    COMMAND ${CMAKE_COMMAND} -E create_symlink ${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json ${CMAKE_CURRENT_SOURCE_DIR}/compile_commands.json
+    )
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -40,7 +46,7 @@ file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/.clang-format-pattern "")
 set(FIRST_SOURCE_FILE 1)
 
 foreach (SOURCE_FILE ${ALL_SOURCE_FILES})
-    string(REGEX MATCHALL "${CMAKE_CURRENT_SOURCE_DIR}(/.*)?/(target|build|CMakeFiles|(cmake-build-.*)|casim)" EXCLUDED_FILE_FOUND ${SOURCE_FILE})
+    string(REGEX MATCHALL "${CMAKE_CURRENT_SOURCE_DIR}(/.*)?/(target|build|CMakeFiles|(cmake-build-.*)|casim|ufi)" EXCLUDED_FILE_FOUND ${SOURCE_FILE})
     if (NOT ${EXCLUDED_FILE_FOUND} EQUAL -1)
         list(REMOVE_ITEM ALL_SOURCE_FILES ${SOURCE_FILE})
     else()
@@ -58,7 +64,6 @@ foreach (SOURCE_FILE ${ALL_SOURCE_FILES})
         endif ()
     endif ()
 endforeach ()
-
 
 add_custom_target(
         format
@@ -86,11 +91,12 @@ add_optional_subdirectory(fsim)
 add_optional_subdirectory(casim)
 add_optional_subdirectory(modelsim)
 add_optional_subdirectory(backup_spi)
-add_optional_subdirectory(spi_player)
+
+add_dependencies(format ufi-format)
 
 if (DPU_INSTALL_SOURCES)
     install(
-        FILES ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt ${CMAKE_CURRENT_SOURCE_DIR}/LICENCE
+        FILES ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE
         DESTINATION src/backends
         )
     install(

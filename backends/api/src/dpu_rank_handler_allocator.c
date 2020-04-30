@@ -3,6 +3,7 @@
  * found in the LICENSE file.
  */
 
+#include <time.h>
 #include <pthread.h>
 #include <dlfcn.h>
 #include <stdio.h>
@@ -18,8 +19,8 @@
 #include <dpu_profile.h>
 #include <dpu_macro_utils.h>
 
-#include "dpu_rank.h"
-#include "dpu_rank_handler.h"
+#include <dpu_rank.h>
+#include <dpu_rank_handler.h>
 
 static bool
 initialize_static_interface_for_target(dpu_type_t target_type, bool verbose);
@@ -244,19 +245,21 @@ dpu_rank_handler_get_rank(struct dpu_rank_t *rank, dpu_rank_handler_context_t ha
         return false;
     }
 
-    status = handler_context->handler->allocate(rank, description);
-
-    if (status != DPU_RANK_SUCCESS) {
+    uint8_t nr_cis = description->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus_per_ci = description->topology.nr_of_dpus_per_control_interface;
+    uint32_t nr_dpus = nr_cis * nr_dpus_per_ci;
+    if ((rank->dpus = calloc(nr_dpus, sizeof(*(rank->dpus)))) == NULL) {
         dpu_free_description(description);
         dpu_release_rank_id(rank->rank_id);
         return false;
     }
 
-    uint8_t nr_cis = rank->description->topology.nr_of_control_interfaces;
-    uint8_t nr_dpus_per_ci = rank->description->topology.nr_of_dpus_per_control_interface;
-    uint32_t nr_dpus = nr_cis * nr_dpus_per_ci;
-    if ((rank->dpus = calloc(nr_dpus, sizeof(*(rank->dpus)))) == NULL) {
-        dpu_rank_handler_free_rank(rank, rank->handler_context);
+    status = handler_context->handler->allocate(rank, description);
+
+    if (status != DPU_RANK_SUCCESS) {
+        free(rank->dpus);
+        dpu_free_description(description);
+        dpu_release_rank_id(rank->rank_id);
         return false;
     }
 
@@ -283,6 +286,8 @@ dpu_rank_handler_get_rank(struct dpu_rank_t *rank, dpu_rank_handler_context_t ha
         dpu_rank_handler_free_rank(rank, rank->handler_context);
         return false;
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &rank->temperature_sample_time);
 
     dpu_rank_list_add(rank);
 

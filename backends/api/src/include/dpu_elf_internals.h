@@ -7,7 +7,7 @@
 #define DPU_ELF_INTERNALS_H
 
 #include <libelf.h>
-#include "dpu_elf.h"
+#include <dpu_elf.h>
 
 typedef struct _elf_fd {
     int fd;

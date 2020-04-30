@@ -66,6 +66,7 @@ dpu_set_program(struct dpu_t *dpu, struct dpu_program_t *program);
 /**
  * @fn dpu_load_elf_program_from_incbin
  * @param elf_info raw ELF information on the program stored when loading
+ * @param path the path to print for debug purpose
  * @param buffer_start the in-memory buffer to load
  * @param buffer_size the size of the buffer
  * @param program information on the ELF program stored when loading
@@ -74,6 +75,7 @@ dpu_set_program(struct dpu_t *dpu, struct dpu_program_t *program);
  */
 dpu_error_t
 dpu_load_elf_program_from_memory(dpu_elf_file_t *elf_info,
+    const char *path,
     uint8_t *buffer_start,
     size_t buffer_size,
     struct dpu_program_t *program,

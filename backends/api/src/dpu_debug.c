@@ -4,26 +4,23 @@
  */
 
 #include <string.h>
-#include <sys/ptrace.h>
-#include <sys/param.h>
-#include <errno.h>
 
 #include <dpu_debug.h>
 #include <dpu_management.h>
 
 #include <dpu_api_log.h>
 #include <dpu_attributes.h>
-#include <dpu_commands.h>
+#include <dpu/ufi_ci_commands.h>
 #include <dpu_config.h>
 #include <dpu_instruction_encoder.h>
 #include <dpu_internals.h>
 #include <dpu_mask.h>
 #include <dpu_predef_programs.h>
 #include <dpu_rank.h>
-#include <ufi_utils.h>
 #include <verbose_control.h>
 #include <dpu_memory.h>
 #include <dpu_elf.h>
+#include <dpu/ufi.h>
 
 #define DPU_FAULT_UNKNOWN_ID (0xffffff)
 
@@ -37,31 +34,17 @@ dpu_trigger_fault_on_rank(struct dpu_rank_t *rank)
 {
     LOG_RANK(VERBOSE, rank, "");
 
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    dpu_error_t status = DPU_OK;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        return DPU_ERR_SYSTEM;
-    }
-
-    for (dpu_slice_id_t each_slice = 0; each_slice < rank->description->topology.nr_of_control_interfaces; ++each_slice) {
-        if (rank->runtime.control_interface.slice_info[each_slice].enabled_dpus == dpu_mask_empty()) {
-            continue;
-        }
-
-        build_select_query_for_all_enabled_dpus(rank, each_slice, query, transaction, status, err);
-        safe_add_query(query, dpu_query_build_set_and_step_dpu_fault_state_for_previous(each_slice), transaction, status, err);
-        safe_add_query(query, dpu_query_build_set_bkp_fault_for_previous(each_slice), transaction, status, err);
-    }
+    dpu_error_t status;
 
     dpu_lock_rank(rank);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-    dpu_unlock_rank(rank);
 
-err:
-    dpu_transaction_free(transaction);
+    uint8_t mask = ALL_CIS;
+    FF(ufi_select_all(rank, &mask));
+    FF(ufi_set_dpu_fault_and_step(rank, mask));
+    FF(ufi_set_bkp_fault(rank, mask));
+
+end:
+    dpu_unlock_rank(rank);
     return status;
 }
 
@@ -78,37 +61,18 @@ dpu_trigger_fault_on_dpu(struct dpu_t *dpu)
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t member_id = dpu->dpu_id;
 
-    dpu_transaction_t transaction;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_query_t query = dpu_query_build_set_and_step_dpu_fault_state_for_dpu(slice_id, member_id);
-
-    if (query == NULL) {
-        dpu_transaction_free(transaction);
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_transaction_add_query_tail(transaction, query);
-
-    query = dpu_query_build_set_bkp_fault_for_dpu(slice_id, member_id);
-
-    if (query == NULL) {
-        dpu_transaction_free(transaction);
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_transaction_add_query_tail(transaction, query);
+    dpu_error_t status;
 
     dpu_lock_rank(rank);
-    dpu_planner_status_e status = dpu_planner_execute_transaction(transaction, rank->handler_context->handler, rank);
+
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    FF(ufi_select_dpu(rank, &mask, member_id));
+    FF(ufi_set_dpu_fault_and_step(rank, mask));
+    FF(ufi_set_bkp_fault(rank, mask));
+
+end:
     dpu_unlock_rank(rank);
-
-    dpu_transaction_free(transaction);
-
-    return map_planner_status_to_api_status(status);
+    return status;
 }
 
 __API_SYMBOL__ dpu_error_t
@@ -116,34 +80,18 @@ dpu_clear_fault_on_rank(struct dpu_rank_t *rank)
 {
     LOG_RANK(VERBOSE, rank, "");
 
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    dpu_error_t status = DPU_OK;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        return DPU_ERR_SYSTEM;
-    }
-
-    for (dpu_slice_id_t each_slice = 0; each_slice < rank->description->topology.nr_of_control_interfaces; ++each_slice) {
-        uint32_t ignored;
-
-        if (rank->runtime.control_interface.slice_info[each_slice].enabled_dpus == dpu_mask_empty()) {
-            continue;
-        }
-
-        build_select_query_for_all_enabled_dpus(rank, each_slice, query, transaction, status, err);
-        /* Reading BKP fault clears potential INTERCEPT fault */
-        safe_add_query(query, dpu_query_build_read_bkp_fault_for_previous(each_slice, &ignored), transaction, status, err);
-        safe_add_query(query, dpu_query_build_clear_dpu_fault_state_for_previous(each_slice), transaction, status, err);
-    }
+    dpu_error_t status;
 
     dpu_lock_rank(rank);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-    dpu_unlock_rank(rank);
 
-err:
-    dpu_transaction_free(transaction);
+    uint8_t mask = ALL_CIS;
+    FF(ufi_select_all(rank, &mask));
+    /* Reading BKP fault clears potential INTERCEPT fault */
+    FF(ufi_read_bkp_fault(rank, mask, NULL));
+    FF(ufi_clear_fault_dpu(rank, mask));
+
+end:
+    dpu_unlock_rank(rank);
     return status;
 }
 
@@ -160,37 +108,19 @@ dpu_clear_fault_on_dpu(struct dpu_t *dpu)
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t member_id = dpu->dpu_id;
 
-    dpu_transaction_t transaction;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        return DPU_ERR_SYSTEM;
-    }
-
-    uint32_t ignored;
-    /* Reading BKP fault clears potential INTERCEPT fault */
-    dpu_query_t query = dpu_query_build_read_bkp_fault_for_dpu(slice_id, member_id, &ignored);
-
-    if (query == NULL) {
-        dpu_transaction_free(transaction);
-        return DPU_ERR_SYSTEM;
-    }
-
-    query = dpu_query_build_clear_dpu_fault_state_for_dpu(slice_id, member_id);
-
-    if (query == NULL) {
-        dpu_transaction_free(transaction);
-        return DPU_ERR_SYSTEM;
-    }
-
-    dpu_transaction_add_query_tail(transaction, query);
+    dpu_error_t status;
 
     dpu_lock_rank(rank);
-    dpu_planner_status_e status = dpu_planner_execute_transaction(transaction, rank->handler_context->handler, rank);
+
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    FF(ufi_select_dpu(rank, &mask, member_id));
+    /* Reading BKP fault clears potential INTERCEPT fault */
+    FF(ufi_read_bkp_fault(rank, mask, NULL));
+    FF(ufi_clear_fault_dpu(rank, mask));
+
+end:
     dpu_unlock_rank(rank);
-
-    dpu_transaction_free(transaction);
-
-    return map_planner_status_to_api_status(status);
+    return status;
 }
 
 __API_SYMBOL__ dpu_error_t
@@ -206,73 +136,42 @@ dpu_extract_pcs_for_dpu(struct dpu_t *dpu, dpu_context_t context)
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t member_id = dpu->dpu_id;
 
-    dpu_error_t status = DPU_OK;
+    dpu_error_t status;
     uint8_t nr_of_threads_per_dpu = rank->description->dpu.nr_of_threads;
-    dpu_pc_mode_e pc_mode = DPU_PC_12;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t ignored;
 
     dpu_lock_rank(rank);
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
 
-    // 1. Fetch PC mode
-    if (!fetch_natural_pc_mode(rank, &pc_mode)) {
-        status = DPU_ERR_INTERNAL;
-        goto free_transaction;
-    }
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    FF(ufi_select_dpu(rank, &mask, member_id));
 
-    // 2. Set fault
-    safe_add_query(
-        query, dpu_query_build_set_and_step_dpu_fault_state_for_dpu(slice_id, member_id), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_set_bkp_fault_for_previous(slice_id), transaction, status, free_transaction);
+    // 1. Set fault
+    FF(ufi_set_dpu_fault_and_step(rank, mask));
+    FF(ufi_set_bkp_fault(rank, mask));
 
-    // 3. Loop on each thread
+    // 2. Loop on each thread
     for (dpu_thread_t each_thread = 0; each_thread < nr_of_threads_per_dpu; ++each_thread) {
-        // 3.1 Resume thread
-        safe_add_query(query,
-            dpu_query_build_resume_thread_for_previous(slice_id, each_thread, &ignored),
-            transaction,
-            status,
-            free_transaction);
+        // 2.1 Resume thread
+        FF(ufi_thread_resume(rank, mask, each_thread, NULL));
     }
-    // Interception Fault Clear
-    safe_add_query(query, dpu_query_build_read_bkp_fault_for_previous(slice_id, &ignored), transaction, status, free_transaction);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-    dpu_transaction_free(transaction);
+    // 3. Interception Fault Clear
+    FF(ufi_read_bkp_fault(rank, mask, NULL));
 
     // 4. Drain Pipeline
-    drain_pipeline(dpu, context, pc_mode, false);
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
+    FF(drain_pipeline(dpu, context, false));
 
     // 5. Clear fault
-    safe_add_query(query, dpu_query_build_clear_bkp_fault_for_previous(slice_id), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_clear_dpu_fault_state_for_previous(slice_id), transaction, status, free_transaction);
+    FF(ufi_select_dpu(rank, &mask, member_id));
+    FF(ufi_clear_fault_bkp(rank, mask));
+    FF(ufi_clear_fault_dpu(rank, mask));
 
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-free_transaction:
-    dpu_transaction_free(transaction);
 end:
     dpu_unlock_rank(rank);
     return status;
 }
 
 typedef dpuinstruction_t *(*fetch_program_t)(iram_size_t *);
-typedef dpu_error_t (*routine_t)(dpu_query_t,
-    dpu_slice_id_t,
+typedef dpu_error_t (*routine_t)(dpu_slice_id_t,
     dpu_member_id_t,
-    dpu_transaction_t,
     struct dpu_rank_t *,
     dpuword_t *,
     dpu_context_t,
@@ -283,44 +182,23 @@ typedef dpu_error_t (*routine_t)(dpu_query_t,
     wram_size_t);
 
 static dpu_error_t
-dpu_boot_and_wait_for_dpu(dpu_query_t query,
-    dpu_slice_id_t slice_id,
-    dpu_member_id_t member_id,
-    dpu_transaction_t transaction,
-    struct dpu_rank_t *rank)
+dpu_boot_and_wait_for_dpu(dpu_slice_id_t slice_id, dpu_member_id_t member_id, struct dpu_rank_t *rank)
 {
-    uint32_t ignored;
-    dpu_error_t status = DPU_OK;
-    dpu_planner_status_e planner_status;
-    uint32_t run_state_result;
+    dpu_error_t status;
     dpu_selected_mask_t mask_one = dpu_mask_one(member_id);
 
     // 1. Boot thread 0
-    safe_add_query(query,
-        dpu_query_build_boot_thread_for_previous(slice_id, 0, &ignored),
-        transaction,
-        status,
-        dpu_boot_and_wait_for_dpu_exit);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, dpu_boot_and_wait_for_dpu_exit);
-
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    FF(ufi_select_dpu(rank, &mask, member_id));
+    FF(ufi_thread_boot(rank, mask, 0, NULL));
 
     // 2. Wait for end of program
-    safe_add_query(query,
-        dpu_query_build_read_dpu_run_state_for_previous(slice_id, &run_state_result),
-        transaction,
-        status,
-        dpu_boot_and_wait_for_dpu_exit);
-
+    dpu_bitfield_t running[DPU_MAX_NR_CIS];
     do {
-        run_state_result = 0;
-        safe_execute_transaction(transaction, rank, planner_status, status, dpu_boot_and_wait_for_dpu_exit);
-    } while ((run_state_result & mask_one) != 0);
+        FF(ufi_read_run_bit(rank, mask, 0, running));
+    } while ((running[slice_id] & mask_one) != 0);
 
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-dpu_boot_and_wait_for_dpu_exit:
+end:
     return status;
 }
 
@@ -337,46 +215,38 @@ dpu_execute_routine_for_dpu(struct dpu_t *dpu,
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t member_id = dpu->dpu_id;
 
-    dpu_error_t status = DPU_OK;
-    dpu_selected_mask_t selected_mask = dpu_mask_one(member_id);
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
+    dpu_error_t status;
     iram_size_t program_size_in_instructions;
     wram_size_t context_size_in_words;
-    dpuinstruction_t *iram_backup;
-    dpuword_t *wram_backup;
-    dpuword_t *raw_context;
+    dpuinstruction_t *iram_backup = NULL;
+    dpuword_t *wram_backup = NULL;
+    dpuword_t *raw_context = NULL;
+    dpuinstruction_t *program = NULL;
+
+    dpuinstruction_t *iram_array[DPU_MAX_NR_CIS];
+    dpuword_t *wram_array[DPU_MAX_NR_CIS];
 
     dpu_lock_rank(rank);
 
-    if ((status = dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_START, (dpu_custom_command_args_t)custom_event)) != DPU_OK) {
-        goto end;
-    }
+    FF(dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_START, (dpu_custom_command_args_t)custom_event));
 
-    // 1. Save IRAM
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
-
-    dpuinstruction_t *program = fetch_program(&program_size_in_instructions);
+    program = fetch_program(&program_size_in_instructions);
 
     if (program == NULL) {
         status = DPU_ERR_SYSTEM;
-        goto free_transaction;
+        goto end;
     }
 
     if ((iram_backup = malloc(program_size_in_instructions * sizeof(*iram_backup))) == NULL) {
         status = DPU_ERR_SYSTEM;
-        goto free_program;
+        goto end;
     }
 
-    safe_add_query(query,
-        dpu_query_build_read_iram_instruction_for_dpu(slice_id, member_id, 0, program_size_in_instructions, iram_backup),
-        transaction,
-        status,
-        free_iram_backup);
+    // 1. Save IRAM
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    FF(ufi_select_dpu(rank, &mask, member_id));
+    iram_array[slice_id] = iram_backup;
+    FF(ufi_iram_read(rank, mask, iram_array, 0, program_size_in_instructions));
 
     // 2. Save WRAM
     uint32_t nr_of_atomic_bits_per_dpu = rank->description->dpu.nr_of_atomic_bits;
@@ -387,14 +257,11 @@ dpu_execute_routine_for_dpu(struct dpu_t *dpu,
 
     if ((wram_backup = malloc(context_size_in_words * sizeof(*wram_backup))) == NULL) {
         status = DPU_ERR_SYSTEM;
-        goto free_iram_backup;
+        goto end;
     }
 
-    safe_add_query(query,
-        dpu_query_build_read_wram_word_for_previous(slice_id, 0, context_size_in_words, wram_backup),
-        transaction,
-        status,
-        free_wram_backup);
+    wram_array[slice_id] = wram_backup;
+    FF(ufi_wram_read(rank, mask, wram_array, 0, context_size_in_words));
 
     // 3. Insert PCs in core dump program
     for (dpu_thread_t each_thread = 0; each_thread < nr_of_threads_per_dpu; ++each_thread) {
@@ -403,26 +270,17 @@ dpu_execute_routine_for_dpu(struct dpu_t *dpu,
     }
 
     // 4. Load IRAM with core dump program
-    safe_add_query(query,
-        dpu_query_build_write_iram_instruction_for_previous(slice_id, selected_mask, 0, program, program_size_in_instructions),
-        transaction,
-        status,
-        free_wram_backup);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, free_wram_backup);
-
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    iram_array[slice_id] = program;
+    FF(ufi_iram_write(rank, mask, iram_array, 0, program_size_in_instructions));
 
     // 5. Execute routine
     if ((raw_context = malloc(context_size_in_words * sizeof(*raw_context))) == NULL) {
         status = DPU_ERR_SYSTEM;
-        goto free_wram_backup;
+        goto end;
     }
 
-    status = routine(query,
-        slice_id,
+    FF(routine(slice_id,
         member_id,
-        transaction,
         rank,
         raw_context,
         context,
@@ -430,50 +288,30 @@ dpu_execute_routine_for_dpu(struct dpu_t *dpu,
         nr_of_atomic_bits_per_dpu,
         nr_of_threads_per_dpu,
         nr_of_work_registers_per_thread,
-        atomic_register_size_in_words);
-
-    free(raw_context);
-    if (status != DPU_OK)
-        goto free_wram_backup;
+        atomic_register_size_in_words));
 
     // 6. Restore WRAM
-    safe_add_query(query,
-        dpu_query_build_write_wram_word_for_previous(slice_id, selected_mask, 0, wram_backup, context_size_in_words),
-        transaction,
-        status,
-        free_wram_backup);
+    wram_array[slice_id] = wram_backup;
+    FF(ufi_wram_write(rank, mask, wram_array, 0, context_size_in_words));
 
     // 7. Restore IRAM
-    safe_add_query(query,
-        dpu_query_build_write_iram_instruction_for_previous(
-            slice_id, selected_mask, 0, iram_backup, program_size_in_instructions),
-        transaction,
-        status,
-        free_wram_backup);
+    iram_array[slice_id] = iram_backup;
+    FF(ufi_iram_write(rank, mask, iram_array, 0, program_size_in_instructions));
 
-    safe_execute_transaction(transaction, rank, planner_status, status, free_wram_backup);
+    FF(dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_END, (dpu_custom_command_args_t)custom_event));
 
-    status = dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_END, (dpu_custom_command_args_t)custom_event);
-
-free_wram_backup:
-    free(wram_backup);
-free_iram_backup:
-    free(iram_backup);
-free_program:
-    free(program);
-free_transaction:
-    if (transaction != NULL)
-        dpu_transaction_free(transaction);
 end:
+    free(raw_context);
+    free(wram_backup);
+    free(iram_backup);
+    free(program);
     dpu_unlock_rank(rank);
     return status;
 }
 
 dpu_error_t
-dpu_extract_context_for_dpu_routine(dpu_query_t query,
-    dpu_slice_id_t slice_id,
+dpu_extract_context_for_dpu_routine(dpu_slice_id_t slice_id,
     dpu_member_id_t member_id,
-    dpu_transaction_t transaction,
     struct dpu_rank_t *rank,
     dpuword_t *raw_context,
     dpu_context_t context,
@@ -484,23 +322,16 @@ dpu_extract_context_for_dpu_routine(dpu_query_t query,
     wram_size_t atomic_register_size_in_words)
 {
     dpu_error_t status;
-    dpu_planner_status_e planner_status;
+    dpuword_t *wram_array[DPU_MAX_NR_CIS];
 
     // 1. Boot and wait
-    status = dpu_boot_and_wait_for_dpu(query, slice_id, member_id, transaction, rank);
-    if (status != DPU_OK)
-        goto dpu_extract_context_for_dpu_routine_exit;
+    FF(dpu_boot_and_wait_for_dpu(slice_id, member_id, rank));
 
     // 2. Fetch context from WRAM
-    safe_add_query(query,
-        dpu_query_build_read_wram_word_for_previous(slice_id, 0, context_size_in_words, raw_context),
-        transaction,
-        status,
-        dpu_extract_context_for_dpu_routine_exit);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, dpu_extract_context_for_dpu_routine_exit);
-
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    FF(ufi_select_dpu(rank, &mask, member_id));
+    wram_array[slice_id] = raw_context;
+    FF(ufi_wram_read(rank, mask, wram_array, 0, context_size_in_words));
 
     // 3. Format context
     for (uint32_t each_atomic_bit = 0; each_atomic_bit < nr_of_atomic_bits_per_dpu; ++each_atomic_bit) {
@@ -524,7 +355,7 @@ dpu_extract_context_for_dpu_routine(dpu_query_t query,
         context->zero_flags[each_thread] = (flags & 2) != 0;
     }
 
-dpu_extract_context_for_dpu_routine_exit:
+end:
     return status;
 }
 
@@ -542,10 +373,8 @@ dpu_extract_context_for_dpu(struct dpu_t *dpu, dpu_context_t context)
 }
 
 dpu_error_t
-dpu_restore_context_for_dpu_routine(dpu_query_t query,
-    dpu_slice_id_t slice_id,
+dpu_restore_context_for_dpu_routine(dpu_slice_id_t slice_id,
     dpu_member_id_t member_id,
-    dpu_transaction_t transaction,
     struct dpu_rank_t *rank,
     dpuword_t *raw_context,
     dpu_context_t context,
@@ -556,8 +385,7 @@ dpu_restore_context_for_dpu_routine(dpu_query_t query,
     wram_size_t atomic_register_size_in_words)
 {
     dpu_error_t status;
-    dpu_selected_mask_t selected_mask = dpu_mask_one(member_id);
-    dpu_planner_status_e planner_status;
+    dpuword_t *wram_array[DPU_MAX_NR_CIS];
 
     // 1. Format raw context
     for (uint32_t each_atomic_bit = 0; each_atomic_bit < nr_of_atomic_bits_per_dpu; ++each_atomic_bit) {
@@ -578,20 +406,15 @@ dpu_restore_context_for_dpu_routine(dpu_query_t query,
     }
 
     // 2. Load WRAM with raw context
-    safe_add_query(query,
-        dpu_query_build_write_wram_word_for_previous(slice_id, selected_mask, 0, raw_context, context_size_in_words),
-        transaction,
-        status,
-        dpu_restore_context_for_dpu_routine_exit);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, dpu_restore_context_for_dpu_routine_exit);
-
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    FF(ufi_select_dpu(rank, &mask, member_id));
+    wram_array[slice_id] = raw_context;
+    FF(ufi_wram_write(rank, mask, wram_array, 0, context_size_in_words));
 
     // 3. Boot thread 0
-    status = dpu_boot_and_wait_for_dpu(query, slice_id, member_id, transaction, rank);
+    FF(dpu_boot_and_wait_for_dpu(slice_id, member_id, rank));
 
-dpu_restore_context_for_dpu_routine_exit:
+end:
     return status;
 }
 
@@ -621,122 +444,71 @@ dpu_initialize_fault_process_for_dpu(struct dpu_t *dpu, dpu_context_t context)
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t member_id = dpu->dpu_id;
 
-    dpu_error_t status = DPU_OK;
+    dpu_error_t status;
     uint8_t nr_of_threads_per_dpu = rank->description->dpu.nr_of_threads;
-    dpu_planner_status_e planner_status;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
     uint32_t bkp_fault;
     uint32_t dma_fault;
     uint32_t mem_fault;
     dpu_thread_t bkp_fault_thread_index;
     dpu_thread_t dma_fault_thread_index;
     dpu_thread_t mem_fault_thread_index;
-    dpu_pc_mode_e pc_mode;
-    uint32_t ignored;
     dpu_selected_mask_t mask_one = dpu_mask_one(member_id);
 
     dpu_lock_rank(rank);
 
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    uint8_t result_array[DPU_MAX_NR_CIS];
 
     // 1. Draining the pipeline
-    // 1.0 Fetching PC mode
-    if (!fetch_natural_pc_mode(rank, &pc_mode)) {
-        status = DPU_ERR_INTERNAL;
-        goto free_transaction;
-    }
     // 1.1 Read and set BKP fault
-    safe_add_query(query,
-        dpu_query_build_read_bkp_fault_thread_index_for_dpu(slice_id, member_id, &bkp_fault_thread_index),
-        transaction,
-        status,
-        free_transaction);
+    FF(ufi_select_dpu(rank, &mask, member_id));
+    FF(ufi_read_bkp_fault_thread_index(rank, mask, result_array));
+    bkp_fault_thread_index = result_array[slice_id];
     // !!! Read BKP fault + Interception Fault Clear
-    safe_add_query(
-        query, dpu_query_build_read_bkp_fault_for_previous(slice_id, &bkp_fault), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_set_bkp_fault_for_previous(slice_id), transaction, status, free_transaction);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-    dpu_transaction_free(transaction);
+    FF(ufi_read_bkp_fault(rank, mask, result_array));
+    bkp_fault = (result_array[slice_id] & mask_one) != 0;
+    FF(ufi_set_bkp_fault(rank, mask));
 
     // 1.2 Pipeline drain
-    drain_pipeline(dpu, context, pc_mode, true);
+    FF(drain_pipeline(dpu, context, true));
 
     // 2. Fetching PCs for non-running threads
     uint8_t nr_of_running_threads = context->nr_of_running_threads;
     if (nr_of_running_threads != nr_of_threads_per_dpu) {
         // 2.1 Resuming all non-running threads
-        if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-            status = DPU_ERR_SYSTEM;
-            goto end;
-        }
-
         // Interception Fault Set
-        safe_add_query(
-            query, dpu_query_build_clear_dpu_fault_state_for_previous(slice_id), transaction, status, free_transaction);
-        safe_add_query(
-            query, dpu_query_build_set_and_step_dpu_fault_state_for_previous(slice_id), transaction, status, free_transaction);
+        FF(ufi_clear_fault_dpu(rank, mask));
+        FF(ufi_set_dpu_fault_and_step(rank, mask));
 
         for (dpu_thread_t each_thread = 0; each_thread < nr_of_threads_per_dpu; ++each_thread) {
             if (context->scheduling[each_thread] == 0xFF) {
-                safe_add_query(query,
-                    dpu_query_build_resume_thread_for_previous(slice_id, each_thread, &ignored),
-                    transaction,
-                    status,
-                    free_transaction);
+                FF(ufi_thread_resume(rank, mask, each_thread, NULL));
             }
         }
 
         // Interception Fault Clear
-        safe_add_query(
-            query, dpu_query_build_read_bkp_fault_for_previous(slice_id, &ignored), transaction, status, free_transaction);
-
-        safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-        dpu_transaction_free(transaction);
+        FF(ufi_read_bkp_fault(rank, mask, NULL));
 
         // 2.2 Draining the pipeline, again
-        drain_pipeline(dpu, context, pc_mode, false);
+        FF(drain_pipeline(dpu, context, false));
     }
 
     // 3. Fault identification
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
-
     // 3.1 Read and clear for dma & mem fault thread index
-    safe_add_query(query,
-        dpu_query_build_read_dma_fault_thread_index_for_previous(slice_id, &dma_fault_thread_index),
-        transaction,
-        status,
-        free_transaction);
-    safe_add_query(query,
-        dpu_query_build_read_mem_fault_thread_index_for_previous(slice_id, &mem_fault_thread_index),
-        transaction,
-        status,
-        free_transaction);
-    // 3.2 Read and clear for dma & mem faults
-    safe_add_query(query, dpu_query_build_clear_bkp_fault_for_previous(slice_id), transaction, status, free_transaction);
-    safe_add_query(query,
-        dpu_query_build_read_and_clear_dma_fault_for_previous(slice_id, &dma_fault),
-        transaction,
-        status,
-        free_transaction);
-    safe_add_query(query,
-        dpu_query_build_read_and_clear_mem_fault_for_previous(slice_id, &mem_fault),
-        transaction,
-        status,
-        free_transaction);
-    // 3.3 Clear fault
-    safe_add_query(query, dpu_query_build_clear_dpu_fault_state_for_previous(slice_id), transaction, status, free_transaction);
+    FF(ufi_read_dma_fault_thread_index(rank, mask, result_array));
+    dma_fault_thread_index = result_array[slice_id];
+    FF(ufi_read_mem_fault_thread_index(rank, mask, result_array));
+    mem_fault_thread_index = result_array[slice_id];
 
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
+    // 3.2 Read and clear for dma & mem faults
+    FF(ufi_clear_fault_bkp(rank, mask));
+    FF(ufi_read_and_clear_dma_fault(rank, mask, result_array));
+    dma_fault = (result_array[slice_id] & mask_one) != 0;
+    FF(ufi_read_and_clear_mem_fault(rank, mask, result_array));
+    mem_fault = (result_array[slice_id] & mask_one) != 0;
+
+    // 3.3 Clear fault
+    FF(ufi_clear_fault_dpu(rank, mask));
 
     if ((bkp_fault & mask_one) != 0) {
         context->bkp_fault = true;
@@ -749,9 +521,7 @@ dpu_initialize_fault_process_for_dpu(struct dpu_t *dpu, dpu_context_t context)
         } else {
             previous_pc = current_pc - 1;
         }
-        if ((status = extract_bkp_fault_id(dpu, previous_pc, &(context->bkp_fault_id))) != DPU_OK) {
-            goto free_transaction;
-        }
+        FF(extract_bkp_fault_id(dpu, previous_pc, &(context->bkp_fault_id)));
 
         /* If bkp_fault_id is unknown, it means that the fault has not been generated by the DPU program, so it came from a host
          * and we can clear the bkp_fault.
@@ -759,24 +529,18 @@ dpu_initialize_fault_process_for_dpu(struct dpu_t *dpu, dpu_context_t context)
         if (context->bkp_fault_id == DPU_FAULT_UNKNOWN_ID) {
             context->bkp_fault = false;
         } else {
-            if ((status = decrement_thread_pc(dpu, bkp_fault_thread_index, context->pcs + bkp_fault_thread_index)) != DPU_OK) {
-                goto free_transaction;
-            }
+            FF(decrement_thread_pc(dpu, bkp_fault_thread_index, context->pcs + bkp_fault_thread_index));
         }
     }
     if ((dma_fault & mask_one) != 0) {
         context->dma_fault = true;
         context->dma_fault_thread_index = dma_fault_thread_index;
-        if ((status = decrement_thread_pc(dpu, dma_fault_thread_index, context->pcs + dma_fault_thread_index)) != DPU_OK) {
-            goto free_transaction;
-        }
+        FF(decrement_thread_pc(dpu, dma_fault_thread_index, context->pcs + dma_fault_thread_index));
     }
     if ((mem_fault & mask_one) != 0) {
         context->mem_fault = true;
         context->mem_fault_thread_index = mem_fault_thread_index;
-        if ((status = decrement_thread_pc(dpu, mem_fault_thread_index, context->pcs + mem_fault_thread_index)) != DPU_OK) {
-            goto free_transaction;
-        }
+        FF(decrement_thread_pc(dpu, mem_fault_thread_index, context->pcs + mem_fault_thread_index));
     }
 
     if ((rank->runtime.run_context.dpu_running[slice_id] & mask_one) != 0) {
@@ -784,8 +548,6 @@ dpu_initialize_fault_process_for_dpu(struct dpu_t *dpu, dpu_context_t context)
         rank->runtime.run_context.nb_dpu_running--;
     }
 
-free_transaction:
-    dpu_transaction_free(transaction);
 end:
     dpu_unlock_rank(rank);
     return status;
@@ -804,26 +566,20 @@ dpu_finalize_fault_process_for_dpu(struct dpu_t *dpu, dpu_context_t context)
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t member_id = dpu->dpu_id;
 
-    dpu_error_t status = DPU_OK;
+    dpu_error_t status;
     uint8_t nr_of_threads_per_dpu = rank->description->dpu.nr_of_threads;
     uint8_t nr_of_running_threads = context->nr_of_running_threads;
     dpu_thread_t scheduling_order[nr_of_threads_per_dpu];
-    dpu_planner_status_e planner_status;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    uint32_t ignored;
 
     dpu_lock_rank(rank);
 
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
+    uint8_t mask = CI_MASK_ONE(slice_id);
+
+    FF(ufi_select_dpu(rank, &mask, member_id));
 
     // 1. Set fault & bkp_fault
-    safe_add_query(
-        query, dpu_query_build_set_and_step_dpu_fault_state_for_dpu(slice_id, member_id), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_set_bkp_fault_for_previous(slice_id), transaction, status, free_transaction);
+    FF(ufi_set_dpu_fault_and_step(rank, mask));
+    FF(ufi_set_bkp_fault(rank, mask));
 
     // 2. Resume running threads
     for (dpu_thread_t each_thread = 0; each_thread < nr_of_threads_per_dpu; ++each_thread) {
@@ -834,28 +590,20 @@ dpu_finalize_fault_process_for_dpu(struct dpu_t *dpu, dpu_context_t context)
     }
 
     for (dpu_thread_t each_running_thread = 0; each_running_thread < nr_of_running_threads; ++each_running_thread) {
-        safe_add_query(query,
-            dpu_query_build_resume_thread_for_previous(slice_id, scheduling_order[each_running_thread], &ignored),
-            transaction,
-            status,
-            free_transaction);
+        FF(ufi_thread_resume(rank, mask, scheduling_order[each_running_thread], NULL));
     }
     // Interception Fault Clear
-    safe_add_query(query, dpu_query_build_read_bkp_fault_for_previous(slice_id, &ignored), transaction, status, free_transaction);
+    FF(ufi_read_bkp_fault(rank, mask, NULL));
 
     // 3. Clear bkp_fault & fault
-    safe_add_query(query, dpu_query_build_clear_bkp_fault_for_previous(slice_id), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_clear_dpu_fault_state_for_previous(slice_id), transaction, status, free_transaction);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
+    FF(ufi_clear_fault_bkp(rank, mask));
+    FF(ufi_clear_fault_dpu(rank, mask));
 
     if (nr_of_running_threads != 0) {
         rank->runtime.run_context.dpu_running[slice_id] |= dpu_mask_one(member_id);
         rank->runtime.run_context.nb_dpu_running++;
     }
 
-free_transaction:
-    dpu_transaction_free(transaction);
 end:
     dpu_unlock_rank(rank);
     return status;
@@ -876,19 +624,14 @@ dpu_execute_thread_step_in_fault_for_dpu(struct dpu_t *dpu, dpu_thread_t thread,
 
     verify_thread_id(thread, rank);
 
-    dpu_error_t status = DPU_OK;
+    dpu_error_t status;
     uint8_t nr_of_threads_per_dpu = rank->description->dpu.nr_of_threads;
-    dpu_planner_status_e planner_status;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    uint32_t ignored;
     uint32_t poison_fault;
     uint32_t dma_fault;
     uint32_t mem_fault;
     uint32_t nr_of_waiting_threads;
     uint32_t step_run_state;
     uint32_t step_fault_state;
-    dpu_pc_mode_e pc_mode;
     dpu_selected_mask_t mask_one = dpu_mask_one(member_id);
     uint8_t nr_of_running_threads = context->nr_of_running_threads;
     dpu_thread_t scheduling_order[nr_of_threads_per_dpu];
@@ -902,27 +645,18 @@ dpu_execute_thread_step_in_fault_for_dpu(struct dpu_t *dpu, dpu_thread_t thread,
         goto end;
     }
 
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
+    uint8_t mask = CI_MASK_ONE(slice_id);
 
-    // 1. Fetch PC mode
-    if (!fetch_natural_pc_mode(rank, &pc_mode)) {
-        status = DPU_ERR_INTERNAL;
-        goto free_transaction;
-    }
+    FF(ufi_select_dpu(rank, &mask, member_id));
 
-    // 2. Set fault & fault_poison
-    safe_add_query(
-        query, dpu_query_build_set_and_step_dpu_fault_state_for_dpu(slice_id, member_id), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_set_poison_fault_for_previous(slice_id), transaction, status, free_transaction);
+    // 1. Set fault & fault_poison
+    FF(ufi_set_dpu_fault_and_step(rank, mask));
+    FF(ufi_set_poison_fault(rank, mask));
 
-    // 3. Resume thread
-    safe_add_query(
-        query, dpu_query_build_resume_thread_for_previous(slice_id, thread, &ignored), transaction, status, free_transaction);
+    // 2. Resume thread
+    FF(ufi_thread_resume(rank, mask, thread, NULL));
 
-    // 4. Resume other running threads
+    // 3. Resume other running threads
     for (dpu_thread_t each_thread = 0; each_thread < nr_of_threads_per_dpu; ++each_thread) {
         uint8_t scheduling_position = context->scheduling[each_thread];
         if (scheduling_position != 0xFF) {
@@ -934,61 +668,39 @@ dpu_execute_thread_step_in_fault_for_dpu(struct dpu_t *dpu, dpu_thread_t thread,
         dpu_thread_t thread_to_be_resumed = scheduling_order[each_running_thread];
 
         if (thread_to_be_resumed != thread) {
-            safe_add_query(query,
-                dpu_query_build_resume_thread_for_previous(slice_id, thread_to_be_resumed, &ignored),
-                transaction,
-                status,
-                free_transaction);
+            FF(ufi_thread_resume(rank, mask, thread_to_be_resumed, NULL));
         }
     }
 
-    // Interception Fault Clear
-    safe_add_query(query, dpu_query_build_read_bkp_fault_for_previous(slice_id, &ignored), transaction, status, free_transaction);
+    // 4. Interception Fault Clear
+    FF(ufi_read_bkp_fault(rank, mask, NULL));
 
     // 5. Execute step (by clearing fault)
-    safe_add_query(query, dpu_query_build_clear_bkp_fault_for_previous(slice_id), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_clear_dpu_fault_state_for_previous(slice_id), transaction, status, free_transaction);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    FF(ufi_clear_fault_bkp(rank, mask));
+    FF(ufi_clear_fault_dpu(rank, mask));
 
     // 5 Bis. Wait for end of step
-    safe_add_query(
-        query, dpu_query_build_read_dpu_run_state_for_previous(slice_id, &step_run_state), transaction, status, free_transaction);
-    safe_add_query(query,
-        dpu_query_build_read_dpu_fault_state_for_previous(slice_id, &step_fault_state),
-        transaction,
-        status,
-        free_transaction);
+    uint8_t result_array[DPU_MAX_NR_CIS];
 
     do {
-        safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
+        FF(ufi_read_dpu_run(rank, mask, result_array));
+        step_run_state = result_array[slice_id];
+        FF(ufi_read_dpu_fault(rank, mask, result_array));
+        step_fault_state = result_array[slice_id];
     } while (((step_run_state & ~step_fault_state) & mask_one) != 0);
 
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
     // 6. Read & clear faults
-    safe_add_query(
-        query, dpu_query_build_read_poison_fault_for_previous(slice_id, &poison_fault), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_clear_poison_fault_for_previous(slice_id), transaction, status, free_transaction);
+    FF(ufi_read_poison_fault(rank, mask, result_array));
+    poison_fault = result_array[slice_id];
+    FF(ufi_clear_fault_poison(rank, mask));
+
     // Interception Fault Clear
-    safe_add_query(query, dpu_query_build_read_bkp_fault_for_previous(slice_id, &ignored), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_clear_bkp_fault_for_previous(slice_id), transaction, status, free_transaction);
-    safe_add_query(query,
-        dpu_query_build_read_and_clear_dma_fault_for_previous(slice_id, &dma_fault),
-        transaction,
-        status,
-        free_transaction);
-    safe_add_query(query,
-        dpu_query_build_read_and_clear_mem_fault_for_previous(slice_id, &mem_fault),
-        transaction,
-        status,
-        free_transaction);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    FF(ufi_read_bkp_fault(rank, mask, NULL));
+    FF(ufi_clear_fault_bkp(rank, mask));
+    FF(ufi_read_and_clear_dma_fault(rank, mask, result_array));
+    dma_fault = result_array[slice_id];
+    FF(ufi_read_and_clear_mem_fault(rank, mask, result_array));
+    mem_fault = result_array[slice_id];
 
     // 7. Resetting scheduling structure
     nr_of_waiting_threads = (uint32_t)(context->nr_of_running_threads - 1);
@@ -1000,12 +712,10 @@ dpu_execute_thread_step_in_fault_for_dpu(struct dpu_t *dpu, dpu_thread_t thread,
     context->nr_of_running_threads = 0;
 
     // 8. Drain pipeline
-    drain_pipeline(dpu, context, pc_mode, true);
+    FF(drain_pipeline(dpu, context, true));
 
     // 9. Clear fault
-    safe_add_query(query, dpu_query_build_clear_dpu_fault_state_for_previous(slice_id), transaction, status, free_transaction);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
+    FF(ufi_clear_fault_dpu(rank, mask));
 
     if ((context->nr_of_running_threads - nr_of_waiting_threads) == 1) {
         // Only one more thread running (the one we stepped on). It may have provoked a fault (if 0 or 2 more threads, the thread
@@ -1014,33 +724,22 @@ dpu_execute_thread_step_in_fault_for_dpu(struct dpu_t *dpu, dpu_thread_t thread,
             // If poison_fault has been cleared, the stepped instruction was a bkp.
             context->bkp_fault = true;
             context->bkp_fault_thread_index = thread;
-            if ((status = decrement_thread_pc(dpu, thread, context->pcs + thread)) != DPU_OK) {
-                goto free_transaction;
-            }
+            FF(decrement_thread_pc(dpu, thread, context->pcs + thread));
 
-            if ((status = extract_bkp_fault_id(dpu, context->pcs[context->bkp_fault_thread_index], &(context->bkp_fault_id)))
-                != DPU_OK) {
-                goto free_transaction;
-            }
+            FF(extract_bkp_fault_id(dpu, context->pcs[context->bkp_fault_thread_index], &(context->bkp_fault_id)));
         }
         if ((dma_fault & mask_one) != 0) {
             context->dma_fault = true;
             context->dma_fault_thread_index = thread;
-            if ((status = decrement_thread_pc(dpu, thread, context->pcs + thread)) != DPU_OK) {
-                goto free_transaction;
-            }
+            FF(decrement_thread_pc(dpu, thread, context->pcs + thread));
         }
         if ((mem_fault & mask_one) != 0) {
             context->mem_fault = true;
             context->mem_fault_thread_index = thread;
-            if ((status = decrement_thread_pc(dpu, thread, context->pcs + thread)) != DPU_OK) {
-                goto free_transaction;
-            }
+            FF(decrement_thread_pc(dpu, thread, context->pcs + thread));
         }
     }
 
-free_transaction:
-    dpu_transaction_free(transaction);
 end:
     dpu_unlock_rank(rank);
     return status;
@@ -1055,7 +754,7 @@ dpu_resume_dpus_for_rank(struct dpu_rank_t *rank, dpu_context_t context)
         for (dpu_id_t each_dpu = 0; each_dpu < rank->description->topology.nr_of_dpus_per_control_interface; ++each_dpu) {
             uint32_t idx_dpu_context = each_dpu * rank->description->topology.nr_of_control_interfaces + each_slice;
 
-            struct dpu_t *dpu = dpu_get(rank, each_slice, each_dpu);
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu);
 
             if (dpu->enabled) {
                 status = dpu_resume_threads_for_dpu(dpu, context + idx_dpu_context);
@@ -1081,21 +780,12 @@ dpu_resume_threads_for_dpu(struct dpu_t *dpu, dpu_context_t context)
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t member_id = dpu->dpu_id;
 
-    dpu_error_t status = DPU_OK;
+    dpu_error_t status;
     uint8_t nr_of_threads_per_dpu = rank->description->dpu.nr_of_threads;
     uint8_t nr_of_running_threads = context->nr_of_running_threads;
     dpu_thread_t scheduling_order[nr_of_threads_per_dpu];
-    dpu_planner_status_e planner_status;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    uint32_t ignored;
 
     dpu_lock_rank(rank);
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
 
     for (dpu_thread_t each_thread = 0; each_thread < nr_of_threads_per_dpu; ++each_thread) {
         uint8_t scheduling_position = context->scheduling[each_thread];
@@ -1104,50 +794,42 @@ dpu_resume_threads_for_dpu(struct dpu_t *dpu, dpu_context_t context)
         }
     }
 
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    FF(ufi_select_dpu(rank, &mask, member_id));
+
     /* 1/ Resume running threads */
     for (dpu_thread_t each_running_thread = 0; each_running_thread < nr_of_running_threads; ++each_running_thread) {
-        safe_add_query(query,
-            dpu_query_build_resume_thread_for_dpu(slice_id, member_id, scheduling_order[each_running_thread], &ignored),
-            transaction,
-            status,
-            free_transaction);
+        FF(ufi_thread_resume(rank, mask, scheduling_order[each_running_thread], NULL));
     }
     /* 2/ Interception Fault Clear */
-    safe_add_query(query, dpu_query_build_read_bkp_fault_for_previous(slice_id, &ignored), transaction, status, free_transaction);
+    FF(ufi_read_bkp_fault(rank, mask, NULL));
 
     /* 3/ Clear bkp_fault & fault */
-    safe_add_query(query, dpu_query_build_clear_bkp_fault_for_previous(slice_id), transaction, status, free_transaction);
-    safe_add_query(query, dpu_query_build_clear_dpu_fault_state_for_previous(slice_id), transaction, status, free_transaction);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
+    FF(ufi_clear_fault_bkp(rank, mask));
+    FF(ufi_clear_fault_dpu(rank, mask));
 
     /* From here we are sure the DPU has resumed. */
     rank->runtime.run_context.dpu_running[slice_id] |= dpu_mask_one(member_id);
     rank->runtime.run_context.nb_dpu_running++;
 
-free_transaction:
-    free(transaction);
 end:
     dpu_unlock_rank(rank);
-
     return status;
 }
 
 __API_SYMBOL__ dpu_error_t
 dpu_stop_dpus_for_rank(struct dpu_rank_t *rank, dpu_context_t context)
 {
-    dpu_error_t cni_status;
+    dpu_error_t status = DPU_OK;
 
     /* The whole rank stopping is not locked, that should not raise problems since the debugger won't do anything in parallel. */
     for (dpu_slice_id_t each_slice = 0; each_slice < rank->description->topology.nr_of_control_interfaces; ++each_slice) {
         for (dpu_member_id_t each_dpu = 0; each_dpu < rank->description->topology.nr_of_dpus_per_control_interface; ++each_dpu) {
             uint32_t idx_dpu_context = each_dpu * rank->description->topology.nr_of_control_interfaces + each_slice;
-            struct dpu_t *dpu = dpu_get(rank, each_slice, each_dpu);
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_slice, each_dpu);
 
             if (dpu->enabled) {
-                cni_status = dpu_stop_threads_for_dpu(dpu, context + idx_dpu_context);
-                if (cni_status != DPU_OK)
-                    return cni_status;
+                FF(dpu_stop_threads_for_dpu(dpu, context + idx_dpu_context));
             }
         }
     }
@@ -1167,7 +849,8 @@ dpu_stop_dpus_for_rank(struct dpu_rank_t *rank, dpu_context_t context)
      *
      */
 
-    return DPU_OK;
+end:
+    return status;
 }
 
 __API_SYMBOL__ dpu_error_t
@@ -1184,26 +867,12 @@ dpu_stop_threads_for_dpu(struct dpu_t *dpu, dpu_context_t context)
     dpu_member_id_t member_id = dpu->dpu_id;
 
     dpu_error_t status;
-    dpu_transaction_t transaction;
-    dpu_pc_mode_e pc_mode;
 
     dpu_lock_rank(rank);
 
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
-
     /* Drain the pipeline */
-    if (!fetch_natural_pc_mode(rank, &pc_mode)) {
-        status = DPU_ERR_INTERNAL;
-        goto free_transaction;
-    }
-
     /* drain_pipeline stores infos about running threads and their place in the FIFO, which is needed for resuming. */
-    status = drain_pipeline(dpu, context, pc_mode, true);
-    if (status != DPU_OK)
-        goto free_transaction;
+    FF(drain_pipeline(dpu, context, true));
 
     dpu_selected_mask_t mask_one = dpu_mask_one(member_id);
 
@@ -1212,8 +881,6 @@ dpu_stop_threads_for_dpu(struct dpu_t *dpu, dpu_context_t context)
         rank->runtime.run_context.nb_dpu_running--;
     }
 
-free_transaction:
-    dpu_transaction_free(transaction);
 end:
     dpu_unlock_rank(rank);
     return status;
@@ -1267,7 +934,7 @@ dpu_save_slice_context_for_dpu(struct dpu_t *dpu)
      * => so once [39: 32] == 0xFF, we re-read the result to make sure it is ok.
      */
     do {
-        rank_status = rank->handler_context->handler->update_commands(rank, &data);
+        rank_status = rank->handler_context->handler->update_commands(rank, data);
         if (rank_status != DPU_RANK_SUCCESS) {
             LOG_DPU(WARNING, dpu, "Failed to read from rank");
             status = map_rank_status_to_api_status(rank_status);
@@ -1288,7 +955,7 @@ dpu_save_slice_context_for_dpu(struct dpu_t *dpu)
         goto free_data;
     }
 
-    rank_status = rank->handler_context->handler->update_commands(rank, &data);
+    rank_status = rank->handler_context->handler->update_commands(rank, data);
     if (rank_status != DPU_RANK_SUCCESS) {
         LOG_DPU(WARNING, dpu, "Failed to read from rank");
         status = map_rank_status_to_api_status(rank_status);
@@ -1310,11 +977,11 @@ dpu_save_slice_context_for_dpu(struct dpu_t *dpu)
          */
         timeout = TIMEOUT_COLOR;
         memset(data, 0, rank->description->topology.nr_of_control_interfaces * sizeof(uint64_t));
-        data[slice_id] = CI_FRAME_DPU_OPERATION_IDENTITY;
-        rank->handler_context->handler->commit_commands(rank, &data);
+        data[slice_id] = CI_IDENTITY;
+        rank->handler_context->handler->commit_commands(rank, data);
 
         do {
-            rank_status = rank->handler_context->handler->update_commands(rank, &data);
+            rank_status = rank->handler_context->handler->update_commands(rank, data);
             if (rank_status != DPU_RANK_SUCCESS) {
                 LOG_DPU(WARNING, dpu, "Failed to read from rank");
                 status = map_rank_status_to_api_status(rank_status);
@@ -1395,23 +1062,22 @@ dpu_restore_slice_context_for_dpu(struct dpu_t *dpu)
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t dpu_pair_base_id = (dpu_member_id_t)(dpu->dpu_id & ~1);
 
-    dpu_planner_status_e planner_status;
-    dpu_query_t query;
-    dpu_transaction_t transaction;
     dpu_rank_status_e rank_status;
     dpu_error_t status = DPU_OK;
-    uint64_t *data;
+    uint64_t *data = NULL;
     uint32_t timeout = TIMEOUT_COLOR;
     uint8_t cmd_type, valid;
 
     dpu_lock_rank(rank);
 
     /* 0/ Restores the mux of the current dpu and of the other dpu in the pair */
-    if (rank->debug.debug_slice_info[slice_id].host_mux_mram_state & (1 << dpu_pair_base_id))
-        dpu_host_get_access_for_dpu(dpu_get(rank, slice_id, dpu_pair_base_id));
+    if (rank->debug.debug_slice_info[slice_id].host_mux_mram_state & (1 << dpu_pair_base_id)) {
+        dpu_host_get_access_for_dpu(DPU_GET_UNSAFE(rank, slice_id, dpu_pair_base_id));
+    }
 
-    if (rank->debug.debug_slice_info[slice_id].host_mux_mram_state & (1 << (dpu_pair_base_id + 1)))
-        dpu_host_get_access_for_dpu(dpu_get(rank, slice_id, dpu_pair_base_id + 1));
+    if (rank->debug.debug_slice_info[slice_id].host_mux_mram_state & (1 << (dpu_pair_base_id + 1))) {
+        dpu_host_get_access_for_dpu(DPU_GET_UNSAFE(rank, slice_id, dpu_pair_base_id + 1));
+    }
 
     /* 1/ Sets the color as it was before the debugger intervention */
     data = malloc(rank->description->topology.nr_of_control_interfaces * sizeof(uint64_t));
@@ -1434,11 +1100,11 @@ dpu_restore_slice_context_for_dpu(struct dpu_t *dpu)
      * [63: 56],
      */
     do {
-        rank_status = rank->handler_context->handler->update_commands(rank, &data);
+        rank_status = rank->handler_context->handler->update_commands(rank, data);
         if (rank_status != DPU_RANK_SUCCESS) {
             LOG_DPU(WARNING, dpu, "Failed to read from rank");
             status = map_rank_status_to_api_status(rank_status);
-            goto free_data;
+            goto end;
         }
 
         timeout--;
@@ -1449,46 +1115,25 @@ dpu_restore_slice_context_for_dpu(struct dpu_t *dpu)
     if (!timeout) {
         LOG_DPU(WARNING, dpu, "Timeout waiting for result to be correct");
         status = DPU_ERR_TIMEOUT;
-        goto free_data;
+        goto end;
     }
 
-    transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces);
-    if (!transaction) {
-        status = DPU_ERR_SYSTEM;
-        goto free_data;
-    }
+    uint8_t mask = CI_MASK_ONE(slice_id);
 
     /* 2/ Restore the last target */
-    if (rank->debug.debug_slice_info[slice_id].slice_target.type != DPU_SLICE_TARGET_CONTROL) {
+    if (rank->debug.debug_slice_info[slice_id].slice_target.type != DPU_SLICE_TARGET_NONE) {
         switch (rank->debug.debug_slice_info[slice_id].slice_target.type) {
             case DPU_SLICE_TARGET_DPU:
-                safe_add_query(query,
-                    dpu_query_build_select_dpu_for_control(slice_id, rank->debug.debug_slice_info[slice_id].slice_target.dpu_id),
-                    transaction,
-                    status,
-                    free_data);
+                FF(ufi_select_dpu(rank, &mask, rank->debug.debug_slice_info[slice_id].slice_target.dpu_id));
                 break;
             case DPU_SLICE_TARGET_GROUP:
-                safe_add_query(query,
-                    dpu_query_build_select_group_for_control(
-                        slice_id, rank->debug.debug_slice_info[slice_id].slice_target.group_id),
-                    transaction,
-                    status,
-                    free_data);
+                FF(ufi_select_group(rank, &mask, rank->debug.debug_slice_info[slice_id].slice_target.group_id));
                 break;
             case DPU_SLICE_TARGET_ALL:
-                safe_add_query(query, dpu_query_build_select_all_for_control(slice_id), transaction, status, free_data);
+                FF(ufi_select_all(rank, &mask));
             default:
                 break;
         }
-
-        planner_status = dpu_planner_execute_transaction(transaction, rank->handler_context->handler, rank);
-        if (planner_status != DPU_PLANNER_SUCCESS) {
-            status = map_planner_status_to_api_status(planner_status);
-            goto free_transaction;
-        }
-
-        dpu_transaction_free_queries_for_slice(transaction, slice_id);
     }
 
     /* Here we have two important things to take care of:
@@ -1503,14 +1148,9 @@ dpu_restore_slice_context_for_dpu(struct dpu_t *dpu)
      *  used when a send frame is sent, on its own, it does nothing.
      */
     if ((rank->runtime.control_interface.color & (1 << slice_id)) == (rank->debug.debug_color & (1 << slice_id))) {
-        uint32_t identity_result;
+        uint32_t identity_result[DPU_MAX_NR_CIS];
 
-        safe_add_query(query, dpu_query_build_identity_for_control(slice_id, &identity_result), transaction, status, free_data);
-        planner_status = dpu_planner_execute_transaction(transaction, rank->handler_context->handler, rank);
-        if (planner_status != DPU_PLANNER_SUCCESS) {
-            status = map_planner_status_to_api_status(planner_status);
-            goto free_transaction;
-        }
+        FF(ufi_identity(rank, mask, identity_result));
     }
 
     /* 3/ Restore the structure value */
@@ -1519,14 +1159,14 @@ dpu_restore_slice_context_for_dpu(struct dpu_t *dpu)
     data[slice_id] = rank->debug.debug_slice_info[slice_id].structure_value;
     /* Update debugger last structure value written */
     rank->runtime.control_interface.slice_info[slice_id].structure_value = rank->debug.debug_slice_info[slice_id].structure_value;
-    rank->handler_context->handler->commit_commands(rank, &data);
+    rank->handler_context->handler->commit_commands(rank, data);
 
     do {
-        rank_status = rank->handler_context->handler->update_commands(rank, &data);
+        rank_status = rank->handler_context->handler->update_commands(rank, data);
         if (rank_status != DPU_RANK_SUCCESS) {
             LOG_DPU(WARNING, dpu, "Failed to read from rank");
             status = map_rank_status_to_api_status(rank_status);
-            goto free_transaction;
+            goto end;
         }
 
         timeout--;
@@ -1538,7 +1178,7 @@ dpu_restore_slice_context_for_dpu(struct dpu_t *dpu)
     if (!timeout) {
         LOG_DPU(WARNING, dpu, "Timeout waiting for result to be correct");
         status = DPU_ERR_TIMEOUT;
-        goto free_transaction;
+        goto end;
     }
 
     /* The above command toggled the color... */
@@ -1547,15 +1187,11 @@ dpu_restore_slice_context_for_dpu(struct dpu_t *dpu)
     /* 4/ Restore the result expected by the host application */
     memset(data, 0, rank->description->topology.nr_of_control_interfaces * sizeof(uint64_t));
     data[slice_id] = 0xFF00000000000000ULL | rank->debug.debug_result[slice_id];
-    rank->handler_context->handler->commit_commands(rank, &data);
+    rank->handler_context->handler->commit_commands(rank, data);
 
-free_transaction:
-    dpu_transaction_free(transaction);
-free_data:
-    free(data);
 end:
+    free(data);
     dpu_unlock_rank(rank);
-
     return status;
 }
 
@@ -1568,13 +1204,13 @@ end:
         (serialized_context) += (curr_elem_size);                                                                                \
         if (serialized_context_end < serialized_context)                                                                         \
             return DPU_ERR_ELF_INVALID_FILE;                                                                                     \
-    } while (0);
+    } while (0)
 
 #define DESERIALIZED_ELEM(elem, serialized_context, serialized_context_end, curr_elem_size)                                      \
     do {                                                                                                                         \
         memcpy((elem), (serialized_context), (curr_elem_size));                                                                  \
         DESERIALIZED_NEXT_ELEM(serialized_context, serialized_context_end, curr_elem_size);                                      \
-    } while (0);
+    } while (0)
 
 __API_SYMBOL__ dpu_error_t
 dpu_deserialize_context(struct dpu_rank_t *rank,
@@ -1645,7 +1281,7 @@ dpu_deserialize_context(struct dpu_rank_t *rank,
     do {                                                                                                                         \
         memcpy((serialized_context), (elem), (elem_size));                                                                       \
         (serialized_context) += (elem_size);                                                                                     \
-    } while (0);
+    } while (0)
 
 __API_SYMBOL__ dpu_error_t
 dpu_serialize_context(struct dpu_rank_t *rank,
@@ -1728,14 +1364,21 @@ dpu_create_core_dump(struct dpu_rank_t *rank,
     uint8_t *context_serialized;
     uint32_t context_serialized_size;
     dpu_error_t status;
+
+    LOG_RANK(VERBOSE, rank, "");
+
     status = dpu_serialize_context(rank, context, &context_serialized, &context_serialized_size);
-    if (status != DPU_OK)
+    if (status != DPU_OK) {
+        LOG_RANK(WARNING, rank, "dpu_serialize_context failed (%s)", dpu_error_to_string(status));
         return status;
+    }
 
     status = dpu_elf_create_core_dump(
         exe_path, core_file_path, wram, mram, iram, context_serialized, wram_size, mram_size, iram_size, context_serialized_size);
-    if (status != DPU_OK)
+    if (status != DPU_OK) {
+        LOG_RANK(WARNING, rank, "dpu_elf_create_core_dump failed (%s)", dpu_error_to_string(status));
         free(context_serialized);
+    }
 
     return status;
 }
@@ -1845,25 +1488,13 @@ decrement_thread_pc(struct dpu_t *dpu, dpu_thread_t thread, iram_addr_t *pc)
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t member_id = dpu->dpu_id;
 
-    dpu_error_t status = DPU_OK;
-    dpu_planner_status_e planner_status;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
+    dpu_error_t status;
     dpuinstruction_t instruction;
     dpuinstruction_t modified_stop_j_instruction;
-    uint32_t ignored;
     uint32_t dpu_is_running;
     dpu_selected_mask_t mask_one = dpu_mask_one(member_id);
 
-    if ((status = dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_START, (dpu_custom_command_args_t)DPU_EVENT_DEBUG_ACTION))
-        != DPU_OK) {
-        goto end;
-    }
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
+    FF(dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_START, (dpu_custom_command_args_t)DPU_EVENT_DEBUG_ACTION));
 
     if (*pc == 0) {
         *pc = rank->description->memories.iram_size - 1;
@@ -1873,44 +1504,28 @@ decrement_thread_pc(struct dpu_t *dpu, dpu_thread_t thread, iram_addr_t *pc)
 
     modified_stop_j_instruction = STOPci(BOOT_CC_TRUE, *pc);
 
-    safe_add_query(query,
-        dpu_query_build_read_iram_instruction_for_dpu(slice_id, member_id, 0, 1, &instruction),
-        transaction,
-        status,
-        free_transaction);
-    safe_add_query(query,
-        dpu_query_build_write_iram_instruction_for_previous(
-            slice_id, dpu_mask_one(member_id), 0, &modified_stop_j_instruction, 1),
-        transaction,
-        status,
-        free_transaction);
-    safe_add_query(
-        query, dpu_query_build_boot_thread_for_previous(slice_id, thread, &ignored), transaction, status, free_transaction);
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    dpuinstruction_t *iram_array[DPU_MAX_NR_CIS];
 
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
+    FF(ufi_select_dpu(rank, &mask, member_id));
 
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    iram_array[slice_id] = &instruction;
+    FF(ufi_iram_read(rank, mask, iram_array, 0, 1));
+    iram_array[slice_id] = &modified_stop_j_instruction;
+    FF(ufi_iram_write(rank, mask, iram_array, 0, 1));
+    FF(ufi_thread_boot(rank, mask, thread, NULL));
 
-    safe_add_query(
-        query, dpu_query_build_read_dpu_run_state_for_previous(slice_id, &dpu_is_running), transaction, status, free_transaction);
-
+    uint8_t result[DPU_MAX_NR_CIS];
     do {
-        safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
+        FF(ufi_read_dpu_run(rank, mask, result));
+        dpu_is_running = result[slice_id];
     } while ((dpu_is_running & mask_one) != 0);
 
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    iram_array[slice_id] = &instruction;
+    FF(ufi_iram_write(rank, mask, iram_array, 0, 1));
 
-    safe_add_query(query,
-        dpu_query_build_write_iram_instruction_for_dpu(slice_id, member_id, dpu_mask_one(member_id), 0, &instruction, 1),
-        transaction,
-        status,
-        free_transaction);
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
+    FF(dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_END, (dpu_custom_command_args_t)DPU_EVENT_DEBUG_ACTION));
 
-free_transaction:
-    dpu_transaction_free(transaction);
 end:
-    status = dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_END, (dpu_custom_command_args_t)DPU_EVENT_DEBUG_ACTION);
-
     return status;
 }

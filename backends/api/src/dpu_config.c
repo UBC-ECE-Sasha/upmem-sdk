@@ -4,171 +4,116 @@
  */
 
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 #include <dpu_config.h>
+#include <dpu_custom.h>
+#include <dpu_error.h>
 #include <dpu_description.h>
 #include <dpu_management.h>
+#include <dpu_types.h>
 
+#include <dpu/ufi_bit_config.h>
+#include <dpu/ufi.h>
 #include <dpu_api_log.h>
 #include <dpu_attributes.h>
 #include <dpu_internals.h>
 #include <dpu_mask.h>
 #include <dpu_predef_programs.h>
 #include <dpu_rank.h>
-#include <ufi_utils.h>
 #include <verbose_control.h>
+#include <dpu_instruction_encoder.h>
 
 static dpu_error_t
-dpu_byte_order(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id, uint64_t *byte_order_result);
+dpu_byte_order(struct dpu_rank_t *rank);
 static dpu_error_t
-dpu_software_reset(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id, bool param_is_null);
+dpu_soft_reset(struct dpu_rank_t *rank, dpu_clock_division_t clock_division);
 static dpu_error_t
-dpu_bit_order(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id, uint64_t byte_order_result);
+dpu_carousel_config(struct dpu_rank_t *rank, const struct dpu_carousel_config *config);
 static dpu_error_t
-dpu_identity(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id);
+dpu_ci_shuffling_box_config(struct dpu_rank_t *rank, const struct dpu_bit_config *config);
 static dpu_error_t
-dpu_thermal_config(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id);
+dpu_bit_config(struct dpu_rank_t *rank, struct dpu_bit_config *config);
 static dpu_error_t
-dpu_set_group(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id);
+dpu_identity(struct dpu_rank_t *rank);
 static dpu_error_t
-dpu_check_for_iram_repair(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id);
+dpu_thermal_config(struct dpu_rank_t *rank, uint8_t thermal_config);
 static dpu_error_t
-dpu_check_for_wram_repair(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id);
+dpu_init_groups(struct dpu_rank_t *rank, const bool *all_dpus_are_enabled_save, const dpu_selected_mask_t *enabled_dpus_save);
 static dpu_error_t
-dpu_clear_debug_replace(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id);
+dpu_iram_repair_config(struct dpu_rank_t *rank);
 static dpu_error_t
-dpu_clear_pc_mode(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id, dpu_pc_mode_e pc_mode);
+dpu_wram_repair_config(struct dpu_rank_t *rank);
 static dpu_error_t
-dpu_clear_faults_for_rank(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id);
+dpu_clear_debug(struct dpu_rank_t *rank);
 static dpu_error_t
-dpu_clear_faults_for_dpu(dpu_transaction_t transaction, struct dpu_t *dpu);
+dpu_clear_run_bits(struct dpu_rank_t *rank);
 static dpu_error_t
-dpu_clear_thread_run_reg_for_rank(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id);
+dpu_set_pc_mode(struct dpu_rank_t *rank, enum dpu_pc_mode pc_mode);
 static dpu_error_t
-dpu_clear_notify_bit_reg_for_rank(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id);
+dpu_set_stack_direction(struct dpu_rank_t *rank, bool stack_is_up);
 static dpu_error_t
-dpu_clear_notify_bit_reg_for_dpu(dpu_transaction_t transaction, struct dpu_t *dpu);
+dpu_reset_internal_state(struct dpu_rank_t *rank);
 static dpu_error_t
-dpu_set_stack_up(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id);
-static dpu_error_t
-dpu_reset_internal_state(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id);
-static dpu_error_t
-dpu_reset_internal_state_for_dpu(dpu_transaction_t transaction, struct dpu_t *dpu);
+dpu_init_mram_mux(struct dpu_rank_t *rank);
 
 static dpu_error_t
-try_to_repair_iram(dpu_transaction_t transaction, struct dpu_t *dpu);
+try_to_repair_iram(struct dpu_rank_t *rank);
 static dpu_error_t
-find_faulty_iram_bits_blocked_at(dpu_transaction_t transaction,
-    struct dpu_rank_t *rank,
-    dpu_slice_id_t slice_id,
-    bool bit_is_set);
-static dpu_error_t
-try_to_repair_wram(dpu_transaction_t transaction, struct dpu_t *dpu);
-static dpu_error_t
-find_faulty_wram_bits_blocked_at(dpu_transaction_t transaction,
-    struct dpu_rank_t *rank,
-    dpu_slice_id_t slice_id,
-    bool bit_is_set);
+try_to_repair_wram(struct dpu_rank_t *rank);
 
 static bool
 byte_order_values_are_compatible(uint64_t reference, uint64_t found);
-static dpu_temperature_e
+static enum dpu_temperature
 from_celsius_to_dpu_enum(uint8_t temperature);
 
 static dpu_error_t
-host_get_access(dpu_transaction_t transaction, struct dpu_t *dpu);
+host_get_access_for_dpu(struct dpu_t *dpu);
 static dpu_error_t
-wavegen_mux_status(dpu_transaction_t transaction,
-    struct dpu_t *dpu,
+wavegen_mux_status_for_dpu(struct dpu_t *dpu, uint8_t expected, uint8_t cmd, uint8_t *ret_dpu_dma_ctrl);
+static dpu_error_t
+host_release_access_for_dpu(struct dpu_t *dpu);
+static dpu_error_t
+dpu_check_wavegen_mux_status_for_dpu(struct dpu_t *dpu, uint8_t expected);
+
+static dpu_error_t
+host_get_access_for_rank(struct dpu_rank_t *rank);
+static dpu_error_t
+wavegen_mux_status_for_rank(struct dpu_rank_t *rank,
     uint8_t expected,
     uint8_t cmd,
-    dpu_dma_ctrl_t *ret_dpu_dma_ctrl);
+    dpu_member_id_t *mask_collision,
+    dpu_member_id_t mask_dpu);
 static dpu_error_t
-host_release_access(dpu_transaction_t transaction, struct dpu_t *dpu);
+host_release_access_for_rank(struct dpu_rank_t *rank);
 static dpu_error_t
-dpu_check_wavegen_mux_status_for_dpu(dpu_transaction_t transaction, struct dpu_t *dpu, uint8_t expected);
+dpu_check_wavegen_mux_status_for_rank(struct dpu_rank_t *rank, uint8_t expected);
 
 static void
 fetch_dma_and_wavegen_configs(uint32_t fck_frequency,
     uint8_t clock_division,
     uint8_t refresh_mode,
-    struct _dpu_dma_engine_configuration_t *dma_config,
-    struct _dpu_waveform_generator_configuration_t *wavegen_config);
-
-#define DMA_CTRL_WRITE(slice, addr, data)                                                                                        \
-    safe_add_query(query,                                                                                                        \
-        dpu_query_build_write_dma_control_for_previous(slice,                                                                    \
-            0x60 | (((addr) >> 4) & 0x0F),                                                                                       \
-            0x60 | (((addr) >> 0) & 0x0F),                                                                                       \
-            0x60 | (((data) >> 4) & 0x0F),                                                                                       \
-            0x60 | (((data) >> 0) & 0x0F),                                                                                       \
-            0x60,                                                                                                                \
-            0x20),                                                                                                               \
-        transaction,                                                                                                             \
-        status,                                                                                                                  \
-        err)
-
-#define WAVEGEN_REG_CONFIG(slice, reg, addr)                                                                                     \
-    do {                                                                                                                         \
-        DMA_CTRL_WRITE(slice, addr + 0, (reg).rise);                                                                             \
-        DMA_CTRL_WRITE(slice, addr + 1, (reg).fall);                                                                             \
-        DMA_CTRL_WRITE(slice, addr + 2, (reg).counter_enable);                                                                   \
-        DMA_CTRL_WRITE(slice, addr + 3, (reg).counter_disable);                                                                  \
-    } while (0)
-
-#define WAVEGEN_TIMING_CONFIG(slice, reg, addr)                                                                                  \
-    do {                                                                                                                         \
-        DMA_CTRL_WRITE(slice, addr + 0, (reg).activate);                                                                         \
-        DMA_CTRL_WRITE(slice, addr + 1, (reg).read);                                                                             \
-        DMA_CTRL_WRITE(slice, addr + 2, (reg).write);                                                                            \
-        DMA_CTRL_WRITE(slice, addr + 3, (reg).precharge);                                                                        \
-        DMA_CTRL_WRITE(slice, addr + 4, (reg).refresh_start);                                                                    \
-        DMA_CTRL_WRITE(slice, addr + 5, (reg).refresh_activ);                                                                    \
-        DMA_CTRL_WRITE(slice, addr + 6, (reg).refresh_prech);                                                                    \
-        DMA_CTRL_WRITE(slice, addr + 7, (reg).refresh_end);                                                                      \
-    } while (0)
-
-#define WAVEGEN_VECTOR_SAMPLING_CONFIG(slice, reg, addr)                                                                         \
-    do {                                                                                                                         \
-        DMA_CTRL_WRITE(slice, addr + 0, (reg).rab_gross);                                                                        \
-        DMA_CTRL_WRITE(slice, addr + 1, (reg).cat_gross);                                                                        \
-        DMA_CTRL_WRITE(slice, addr + 2, (reg).dwbsb_gross);                                                                      \
-        DMA_CTRL_WRITE(slice, addr + 3, (reg).drbsb_gross);                                                                      \
-        DMA_CTRL_WRITE(slice, addr + 4, (reg).drbsb_fine);                                                                       \
-    } while (0)
-
-#define WAVEGEN_ROWHAMMER_AND_REFRESH_CONFIG(slice, reg, addr)                                                                   \
-    do {                                                                                                                         \
-        DMA_CTRL_WRITE(slice, addr + 0, ((reg) >> 0) & 0xFF);                                                                    \
-        DMA_CTRL_WRITE(slice, addr + 1, ((reg) >> 8) & 0xFF);                                                                    \
-    } while (0)
-
-#define WAVEGEN_ROWHAMMER_CONFIG(slice, reg, addr)                                                                               \
-    do {                                                                                                                         \
-        DMA_CTRL_WRITE(slice, addr + 0, ((reg) >> 0) & 0xFF);                                                                    \
-        DMA_CTRL_WRITE(slice, addr + 1, ((reg) >> 8) & 0xFF);                                                                    \
-    } while (0)
+    struct dpu_dma_config *dma_config,
+    struct dpu_wavegen_config *wavegen_config);
 
 #define EXPECTED_BYTE_ORDER_RESULT_AFTER_CONFIGURATION 0x000103FF0F8FCFEFULL
 
-#define IRAM_TIMING_SAFE_VALUE 0x04
-#define IRAM_TIMING_NORMAL_VALUE 0x04
-#define IRAM_TIMING_AGGRESSIVE_VALUE 0x05
-
-#define RFRAM_TIMING_SAFE_VALUE 0x01
-#define RFRAM_TIMING_NORMAL_VALUE 0x04
-#define RFRAM_TIMING_AGGRESSIVE_VALUE 0x05
-
-#define WRAM_TIMING_SAFE_VALUE 0x05
-#define WRAM_TIMING_NORMAL_VALUE 0x05
-#define WRAM_TIMING_AGGRESSIVE_VALUE 0x06
-
 #define REFRESH_MODE_VALUE 4
+
+/* Bit set when the DPU has the control of the bank */
+#define MUX_DPU_BANK_CTRL (1 << 0)
+/* Bit set when the DPU can write to the bank */
+#define MUX_DPU_WRITE_CTRL (1 << 1)
+/* Bit set when the host or the DPU wrote to the bank without permission */
+#define MUX_COLLISION_ERR (1 << 7)
+
+#define WAVEGEN_MUX_HOST_EXPECTED 0x00
+#define WAVEGEN_MUX_DPU_EXPECTED (MUX_DPU_BANK_CTRL | MUX_DPU_WRITE_CTRL)
 
 /* clang-format off */
 
-__API_SYMBOL__ const struct _dpu_dma_engine_configuration_t dma_engine_cas_config = {
+__API_SYMBOL__ const struct dpu_dma_config dma_engine_cas_config = {
     .refresh_access_number = 53,
     .column_read_latency = 7,
     .minimal_access_number = 0,
@@ -180,7 +125,7 @@ __API_SYMBOL__ const struct _dpu_dma_engine_configuration_t dma_engine_cas_confi
 };
 
 /* Configuration for DPU_CLOCK_DIV2 */
-__API_SYMBOL__ const struct _dpu_dma_engine_configuration_t dma_engine_clock_div2_config = {
+__API_SYMBOL__ const struct dpu_dma_config dma_engine_clock_div2_config = {
     /* refresh_access_number computed later depending on frequency */
     .column_read_latency = 9,
     .minimal_access_number = 0,
@@ -191,7 +136,7 @@ __API_SYMBOL__ const struct _dpu_dma_engine_configuration_t dma_engine_clock_div
     .sdma_time_start_wb_f1 = 0,
 };
 
-__API_SYMBOL__ const struct _dpu_waveform_generator_configuration_t waveform_generator_clock_div2_config = {
+__API_SYMBOL__ const struct dpu_wavegen_config waveform_generator_clock_div2_config = {
     .MCBAB    = { .rise = 0x00, .fall = 0x39, .counter_enable = 0x01, .counter_disable = 0x01 },
     .RCYCLKB  = { .rise = 0x33, .fall = 0x39, .counter_enable = 0x01, .counter_disable = 0x03 },
     .WCYCLKB  = { .rise = 0x31, .fall = 0x00, .counter_enable = 0x02, .counter_disable = 0x03 },
@@ -208,7 +153,7 @@ __API_SYMBOL__ const struct _dpu_waveform_generator_configuration_t waveform_gen
     .row_hammer_config = 0x06 };
 
 /* Configuration for DPU_CLOCK_DIV3 */
-__API_SYMBOL__ const struct _dpu_dma_engine_configuration_t dma_engine_clock_div3_config = {
+__API_SYMBOL__ const struct dpu_dma_config dma_engine_clock_div3_config = {
     /* refresh_access_number computed later depending on frequency */
     .column_read_latency = 8,
     .minimal_access_number = 0,
@@ -219,7 +164,7 @@ __API_SYMBOL__ const struct _dpu_dma_engine_configuration_t dma_engine_clock_div
     .sdma_time_start_wb_f1 = 0,
 };
 
-__API_SYMBOL__ const struct _dpu_waveform_generator_configuration_t waveform_generator_clock_div3_config = {
+__API_SYMBOL__ const struct dpu_wavegen_config waveform_generator_clock_div3_config = {
     .MCBAB    = { .rise = 0x00, .fall = 0x39, .counter_enable = 0x02, .counter_disable = 0x02 },
     .RCYCLKB  = { .rise = 0x33, .fall = 0x39, .counter_enable = 0x02, .counter_disable = 0x04 },
     .WCYCLKB  = { .rise = 0x31, .fall = 0x00, .counter_enable = 0x03, .counter_disable = 0x04 },
@@ -236,7 +181,7 @@ __API_SYMBOL__ const struct _dpu_waveform_generator_configuration_t waveform_gen
     .row_hammer_config = 0x06 };
 
 /* Configuration for DPU_CLOCK_DIV4 */
-__API_SYMBOL__ const struct _dpu_dma_engine_configuration_t dma_engine_clock_div4_config = {
+__API_SYMBOL__ const struct dpu_dma_config dma_engine_clock_div4_config = {
     /* refresh_access_number computed later depending on frequency */
     .column_read_latency = 7,
     .minimal_access_number = 0,
@@ -247,7 +192,7 @@ __API_SYMBOL__ const struct _dpu_dma_engine_configuration_t dma_engine_clock_div
     .sdma_time_start_wb_f1 = 0,
 };
 
-__API_SYMBOL__ const struct _dpu_waveform_generator_configuration_t waveform_generator_clock_div4_config = {
+__API_SYMBOL__ const struct dpu_wavegen_config waveform_generator_clock_div4_config = {
     .MCBAB    = { .rise = 0x00, .fall = 0x39, .counter_enable = 0x03, .counter_disable = 0x03 },
     .RCYCLKB  = { .rise = 0x33, .fall = 0x39, .counter_enable = 0x03, .counter_disable = 0x05 },
     .WCYCLKB  = { .rise = 0x31, .fall = 0x00, .counter_enable = 0x04, .counter_disable = 0x05 },
@@ -264,412 +209,220 @@ __API_SYMBOL__ const struct _dpu_waveform_generator_configuration_t waveform_gen
     .row_hammer_config = 0x06 };
 
 /* clang-format on */
+static void
+save_enabled_dpus(struct dpu_rank_t *rank,
+    bool *all_dpus_are_enabled_save,
+    dpu_selected_mask_t *enabled_dpus_save,
+    bool update_save)
+{
+    dpu_description_t desc = rank->description;
+    uint8_t nr_cis = desc->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus = desc->topology.nr_of_dpus_per_control_interface;
+    dpu_selected_mask_t all_dpus_mask = dpu_mask_all(nr_dpus);
+
+    for (dpu_slice_id_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
+        struct dpu_configuration_slice_info_t *ci_info = &rank->runtime.control_interface.slice_info[each_ci];
+
+        all_dpus_are_enabled_save[each_ci]
+            = !update_save ? ci_info->all_dpus_are_enabled : all_dpus_are_enabled_save[each_ci] & ci_info->all_dpus_are_enabled;
+        enabled_dpus_save[each_ci] = !update_save ? ci_info->enabled_dpus : enabled_dpus_save[each_ci] & ci_info->enabled_dpus;
+
+        /* Do not even talk to CIs where ALL dpus are disabled. */
+        if (!ci_info->enabled_dpus)
+            continue;
+
+        ci_info->all_dpus_are_enabled = true;
+        ci_info->enabled_dpus = all_dpus_mask;
+
+        for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus; ++each_dpu) {
+            DPU_GET_UNSAFE(rank, each_ci, each_dpu)->enabled = true;
+        }
+    }
+}
 
 __API_SYMBOL__ dpu_error_t
 dpu_reset_rank(struct dpu_rank_t *rank)
 {
     LOG_RANK(VERBOSE, rank, "");
 
-    dpu_transaction_t transaction;
     dpu_error_t status;
 
-    if ((status = dpu_custom_for_rank(rank, DPU_COMMAND_EVENT_START, (dpu_custom_command_args_t)DPU_EVENT_RESET)) != DPU_OK) {
-        goto end;
-    }
+    dpu_lock_rank(rank);
 
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
+    dpu_description_t desc = rank->description;
+    struct dpu_bit_config *bit_config = &desc->configuration.pcb_transformation;
 
-    // todo inject the for loop in each reset subfunction?
-    for (dpu_slice_id_t each_slice = 0; each_slice < rank->description->topology.nr_of_control_interfaces; ++each_slice) {
-        /* 1/ [CI] Byte order */
-        uint64_t byte_order_result;
+    struct dpu_dma_config std_dma_config;
+    struct dpu_wavegen_config wavegen_config;
 
-        uint8_t nr_dpus_per_ci = rank->description->topology.nr_of_dpus_per_control_interface;
-        bool saved_dpus_are_enabled = rank->runtime.control_interface.slice_info[each_slice].all_dpus_are_enabled;
-        dpu_selected_mask_t saved_enabled_dpus = rank->runtime.control_interface.slice_info[each_slice].enabled_dpus;
-        dpu_selected_mask_t mask_all_dpus = dpu_mask_all(nr_dpus_per_ci);
+    fetch_dma_and_wavegen_configs(desc->configuration.fck_frequency_in_mhz,
+        desc->timings.clock_division,
+        REFRESH_MODE_VALUE,
+        &std_dma_config,
+        &wavegen_config);
 
-        /* Enabling ALL DPUs (regardless of disabled DPUs) for the reset process */
-        rank->runtime.control_interface.slice_info[each_slice].all_dpus_are_enabled = true;
-        rank->runtime.control_interface.slice_info[each_slice].enabled_dpus = mask_all_dpus;
-        for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-            dpu_get(rank, each_slice, each_dpu)->enabled = true;
-        }
+    const struct dpu_dma_config *dma_config = (rank->type == CYCLE_ACCURATE_SIMULATOR) ? &dma_engine_cas_config : &std_dma_config;
 
-        status = dpu_byte_order(transaction, rank, each_slice, &byte_order_result);
-        if (status != DPU_OK)
-            goto err_query;
+    /* All DPUs are enabled during the reset */
+    bool all_dpus_are_enabled_save[DPU_MAX_NR_CIS];
+    dpu_selected_mask_t enabled_dpus_save[DPU_MAX_NR_CIS];
 
-        /* 1 Bis/ [CI] Software reset */
-        /* This soft reset is needed to reset the color and start from a known state. */
-        status = dpu_software_reset(transaction, rank, each_slice, true);
-        if (status != DPU_OK)
-            goto err_query;
+    save_enabled_dpus(rank, all_dpus_are_enabled_save, enabled_dpus_save, false);
 
-        /* 2/ [CI] Bit order */
-        status = dpu_bit_order(transaction, rank, each_slice, byte_order_result);
-        if (status != DPU_OK)
-            goto err_query;
+    FF(dpu_custom_for_rank(rank, DPU_COMMAND_EVENT_START, (dpu_custom_command_args_t)DPU_EVENT_RESET));
 
-        /* 3/ [CI] Software reset */
-        status = dpu_software_reset(transaction, rank, each_slice, false);
-        if (status != DPU_OK)
-            goto err_query;
+    FF(dpu_byte_order(rank));
+    FF(dpu_soft_reset(rank, DPU_CLOCK_DIV8));
+    FF(dpu_bit_config(rank, bit_config));
+    FF(dpu_ci_shuffling_box_config(rank, bit_config));
+    FF(dpu_soft_reset(rank, from_division_factor_to_dpu_enum(desc->timings.clock_division)));
+    FF(dpu_ci_shuffling_box_config(rank, bit_config));
+    FF(dpu_identity(rank));
+    FF(dpu_thermal_config(rank, desc->timings.std_temperature));
 
-        /* 4/ [CI] Bit order, again */
-        status = dpu_bit_order(transaction, rank, each_slice, byte_order_result);
-        if (status != DPU_OK)
-            goto err_query;
+    FF(dpu_carousel_config(rank, &desc->timings.carousel));
 
-        /* 5/ [CI] Identity */
-        status = dpu_identity(transaction, rank, each_slice);
+    FF(dpu_iram_repair_config(rank));
+    save_enabled_dpus(rank, all_dpus_are_enabled_save, enabled_dpus_save, true);
 
-        if (status != DPU_OK)
-            goto err_query;
+    FF(dpu_wram_repair_config(rank));
+    save_enabled_dpus(rank, all_dpus_are_enabled_save, enabled_dpus_save, true);
 
-        /* 6/ [CI] Thermal config */
-        status = dpu_thermal_config(transaction, rank, each_slice);
-        if (status != DPU_OK)
-            goto err_query;
+    FF(dpu_dma_config(rank, dma_config));
+    FF(dpu_dma_shuffling_box_config(rank, bit_config));
+    FF(dpu_wavegen_config(rank, &wavegen_config));
 
-        /* 7/ [CI] [DPU] Carousel configuration */
-        struct _dpu_carousel_configuration_t carousel_config = {
-            .cmd_duration = rank->description->timings.cmd_duration,
-            .cmd_sampling = rank->description->timings.cmd_sampling,
-            .res_duration = rank->description->timings.res_duration,
-            .res_sampling = rank->description->timings.res_sampling,
-        };
-        status = dpu_configure_carousel(rank, each_slice, &carousel_config);
-        if (status != DPU_OK)
-            goto err_query;
+    FF(dpu_clear_debug(rank));
+    FF(dpu_clear_run_bits(rank));
 
-        /* Reverting disabled DPUs before setting groups */
+    FF(dpu_set_pc_mode(rank, DPU_PC_MODE_16));
+    FF(dpu_set_stack_direction(rank, true));
+    FF(dpu_reset_internal_state(rank));
 
-        rank->runtime.control_interface.slice_info[each_slice].all_dpus_are_enabled = saved_dpus_are_enabled;
-        rank->runtime.control_interface.slice_info[each_slice].enabled_dpus = saved_enabled_dpus;
-        for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-            dpu_get(rank, each_slice, each_dpu)->enabled = (saved_enabled_dpus & (1 << each_dpu)) != 0;
-        }
+    FF(dpu_init_mram_mux(rank));
+    FF(dpu_init_groups(rank, all_dpus_are_enabled_save, enabled_dpus_save));
 
-        /* 8/ [DPU] Set group */
-        status = dpu_set_group(transaction, rank, each_slice);
-        if (status != DPU_OK)
-            goto err_query;
+    FF(dpu_custom_for_rank(rank, DPU_COMMAND_ALL_SOFT_RESET, NULL));
+    FF(dpu_custom_for_rank(rank, DPU_COMMAND_EVENT_END, (dpu_custom_command_args_t)DPU_EVENT_RESET));
 
-        /* Back to ALL DPUs enabled for the rest of the reset */
-        rank->runtime.control_interface.slice_info[each_slice].all_dpus_are_enabled = true;
-        rank->runtime.control_interface.slice_info[each_slice].enabled_dpus = mask_all_dpus;
-        for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-            dpu_get(rank, each_slice, each_dpu)->enabled = true;
-        }
-
-        /* 9/ [DPU] Iram repair */
-        status = dpu_check_for_iram_repair(transaction, rank, each_slice);
-        if (status != DPU_OK)
-            goto err_query;
-
-        /* 9 Bis/ [DPU] Wram repair */
-        status = dpu_check_for_wram_repair(transaction, rank, each_slice);
-        if (status != DPU_OK)
-            goto err_query;
-
-        struct _dpu_dma_engine_configuration_t dma_engine_config;
-        struct _dpu_waveform_generator_configuration_t waveform_generator_config;
-
-        fetch_dma_and_wavegen_configs(rank->description->configuration.fck_frequency_in_mhz,
-            rank->description->timings.clock_division,
-            REFRESH_MODE_VALUE,
-            &dma_engine_config,
-            &waveform_generator_config);
-
-        /* 9 Ter/ [DPU] DMA Engine Configuration */
-        status = dpu_configure_dma_engine(
-            rank, each_slice, (rank->type == CYCLE_ACCURATE_SIMULATOR) ? &dma_engine_cas_config : &dma_engine_config);
-        if (status != DPU_OK)
-            goto err_query;
-        status = dpu_configure_dma_shuffling_box(rank, each_slice, &rank->description->configuration.pcb_transformation);
-        if (status != DPU_OK)
-            goto err_query;
-
-        /* 9 Quater/ [DPU] Waveform Generator Configuration */
-        status = dpu_configure_waveform_generator(rank, each_slice, &waveform_generator_config);
-        if (status != DPU_OK)
-            goto err_query;
-
-        /* 10/ [DPU] Clear Debug Replace */
-        status = dpu_clear_debug_replace(transaction, rank, each_slice);
-        if (status != DPU_OK)
-            goto err_query;
-
-        /* 11/ [DPU] Clear PC mode (ie set it to DPU_PC_16) */
-        status = dpu_clear_pc_mode(transaction, rank, each_slice, DPU_PC_16);
-        if (status != DPU_OK)
-            goto err_query;
-
-        /* 12/ [DPU] Clear faults */
-        status = dpu_clear_faults_for_rank(transaction, rank, each_slice);
-        if (status != DPU_OK)
-            goto err_query;
-
-        /* 13/ [DPU] Clear thread run reg */
-        status = dpu_clear_thread_run_reg_for_rank(transaction, rank, each_slice);
-        if (status != DPU_OK)
-            goto err_query;
-
-        /* 14/ [DPU] Clear notify bit reg */
-        status = dpu_clear_notify_bit_reg_for_rank(transaction, rank, each_slice);
-        if (status != DPU_OK)
-            goto err_query;
-
-        /* 15/ [DPU] Set Stack_Up */
-        status = dpu_set_stack_up(transaction, rank, each_slice);
-        if (status != DPU_OK)
-            goto err_query;
-
-        /* 16/ [DPU] Reset time configuration, zero and carry flags, pcs */
-        status = dpu_reset_internal_state(transaction, rank, each_slice);
-        if (status != DPU_OK)
-            goto err_query;
-
-        /* 17/ [DPU] Give MRAM control to the DPUs */
-        for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus_per_ci; each_dpu += 2) {
-            struct dpu_t *dpu = dpu_get(rank, each_slice, each_dpu);
-            status = dpu_host_release_access_for_dpu(dpu);
-            if (status != DPU_OK)
-                goto err_query;
-        }
-
-        /* Setting enabled DPUs information for the rest of the execution */
-        rank->runtime.control_interface.slice_info[each_slice].all_dpus_are_enabled = saved_dpus_are_enabled;
-        rank->runtime.control_interface.slice_info[each_slice].enabled_dpus = saved_enabled_dpus;
-        for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
-            dpu_get(rank, each_slice, each_dpu)->enabled = (saved_enabled_dpus & (1 << each_dpu)) != 0;
-        }
-
-        /* 18/ Backend custom operation */
-        status = map_rank_status_to_api_status(
-            rank->handler_context->handler->custom_operation(rank, each_slice, 0, DPU_COMMAND_ALL_SOFT_RESET, NULL));
-        if (status != DPU_OK)
-            goto err_query;
-    }
-
-    status = dpu_custom_for_rank(rank, DPU_COMMAND_EVENT_END, (dpu_custom_command_args_t)DPU_EVENT_RESET);
-
-err_query:
-    dpu_transaction_free(transaction);
 end:
+    dpu_unlock_rank(rank);
     return status;
 }
 
 __API_SYMBOL__ dpu_error_t
-dpu_soft_reset_dpu(struct dpu_t *dpu)
+dpu_reset_dpu(struct dpu_t *dpu)
 {
     LOG_DPU(VERBOSE, dpu, "");
 
-    if (!dpu->enabled) {
-        return DPU_ERR_DPU_DISABLED;
-    }
-
     dpu_error_t status;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    dpu_pc_mode_e pc_mode;
-    dpu_planner_status_e planner_status;
-    dpu_rank_status_e rank_status;
-    uint32_t ignored;
-
-    struct dpu_rank_t *rank = dpu_get_rank(dpu);
+    struct dpu_rank_t *rank = dpu->rank;
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t member_id = dpu->dpu_id;
+    dpu_selected_mask_t mask_one = dpu_mask_one(member_id);
 
-    if ((status = dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_START, (dpu_custom_command_args_t)DPU_EVENT_RESET)) != DPU_OK) {
-        goto end;
-    }
+    dpu_lock_rank(rank);
 
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
-
-    /* 1/ Stop running thread by injecting a bkp fault */
-
-    safe_add_query(
-        query, dpu_query_build_set_and_step_dpu_fault_state_for_dpu(slice_id, member_id), transaction, status, err_query);
-    safe_add_query(query, dpu_query_build_set_bkp_fault_for_dpu(slice_id, member_id), transaction, status, err_query);
-    /* Interception fault clear */
-    safe_add_query(query, dpu_query_build_read_bkp_fault_for_dpu(slice_id, member_id, &ignored), transaction, status, err_query);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-
-    /* 2/ Stop all threads */
-    if (!fetch_natural_pc_mode(rank, &pc_mode)) {
-        status = DPU_ERR_INTERNAL;
-        goto err_query;
-    }
-
-    status = drain_pipeline(dpu, NULL, pc_mode, false);
-    if (status != DPU_OK)
-        goto err_query;
-
-    /* 3/ Clear all faults: dma, mem, bkp, poison and global */
-    status = dpu_clear_faults_for_dpu(transaction, dpu);
-    if (status != DPU_OK)
-        goto err_query;
-
-    /* 4/ Reset time configuration, zero and carry flags, pcs */
-    status = dpu_reset_internal_state_for_dpu(transaction, dpu);
-    if (status != DPU_OK)
-        goto err_query;
-
-    /* 5/ Clear Notify bits */
-    status = dpu_clear_notify_bit_reg_for_dpu(transaction, dpu);
-    if (status != DPU_OK)
-        goto err_query;
-
-    /* 6/ Backend custom operation */
-    rank_status = rank->handler_context->handler->custom_operation(rank, slice_id, member_id, DPU_COMMAND_DPU_SOFT_RESET, NULL);
-    if (rank_status != DPU_RANK_SUCCESS) {
-        status = map_rank_status_to_api_status(rank_status);
-        goto err_query;
-    }
-
-    status = dpu_custom_for_dpu(dpu, DPU_COMMAND_EVENT_END, (dpu_custom_command_args_t)DPU_EVENT_RESET);
-
-err_query:
-    dpu_transaction_free(transaction);
-end:
-    return status;
-}
-
-__API_SYMBOL__ dpu_error_t
-dpu_configure_carousel(struct dpu_rank_t *rank, dpu_slice_id_t slice_id, const struct _dpu_carousel_configuration_t *config)
-{
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
-
-    uint8_t cmd_duration = config->cmd_duration;
-    uint8_t cmd_sampling = config->cmd_sampling;
-    uint8_t res_duration = config->res_duration;
-    uint8_t res_sampling = config->res_sampling;
-
-    LOG_CI(DEBUG,
-        rank,
-        slice_id,
-        "cmd_duration: %d cmd_sampling: %d res_duration: %d res_sampling: %d",
-        cmd_duration,
-        cmd_sampling,
-        res_duration,
-        res_sampling);
-
-    // We suppose that we can configure the caroussel for ALL dpus (even disabled DPUs)
-    safe_add_query(query, dpu_query_build_select_all_for_control(slice_id), transaction, status, err_query);
-
-    /* a/ [CI]  Cmd futur lllll */
-    safe_add_query(
-        query, dpu_query_build_command_duration_configuration_for_control(slice_id, cmd_duration), transaction, status, end);
-    /* b/ [DPU] Cmd futur lllll */
-    safe_add_query(
-        query, dpu_query_build_command_bus_duration_configuration_for_previous(slice_id, cmd_duration), transaction, status, end);
-    /* c/ [DPU] Cmd futur vvvvv */
-    safe_add_query(
-        query, dpu_query_build_command_bus_sampling_configuration_for_previous(slice_id, cmd_sampling), transaction, status, end);
-    /* d/ [DPU] Cmd sync */
-    safe_add_query(query, dpu_query_build_command_bus_synchronization_for_previous(slice_id), transaction, status, end);
-    /* e/ [CI]  Res futur lllll */
-    safe_add_query(
-        query, dpu_query_build_result_duration_configuration_for_control(slice_id, res_duration), transaction, status, end);
-    /* f/ [CI]  Res futur vvvvv */
-    safe_add_query(
-        query, dpu_query_build_result_sampling_configuration_for_control(slice_id, res_sampling), transaction, status, end);
-    /* g/ [DPU] Res futur lllll */
-    safe_add_query(
-        query, dpu_query_build_result_bus_duration_configuration_for_previous(slice_id, res_duration), transaction, status, end);
-    /* h/ [DPU] Res sync */
-    safe_add_query(query, dpu_query_build_result_bus_synchronization_for_previous(slice_id), transaction, status, end);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-
-err_query:
-    dpu_transaction_free(transaction);
-end:
-    return status;
-}
-
-__API_SYMBOL__ dpu_error_t
-dpu_configure_ci_shuffling_box(struct dpu_rank_t *rank, dpu_slice_id_t slice_id, const struct _dpu_pcb_transformation_t *config)
-{
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t bit_order_result;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
-
-    LOG_CI(DEBUG,
-        rank,
-        slice_id,
-        "CI shuffling box config: cpu_to_dpu: 0x%04x dpu_to_cpu: 0x%04x nibble_swap: 0x%02x",
-        config->cpu_to_dpu,
-        config->dpu_to_cpu,
-        config->nibble_swap);
-
-    /* Important: no shuffling boxes, so we have to software-shuffle correctly for the parameters of BIT_ORDER
-     * to be understood...We want DPU to read a, so we send m(a):
-     * CPU: a       -> mm(a)        DPU
-     * CPU: m(a)    -> mm(m(a)) = a DPU
-     * But no need to shuffle nibble swap since it is either 0 or 0xFFFFFFFF and nothing to do with bit_order_result.
+    /* There is no explicit reset command for a DPU.
+     * We just stop the DPU, if it is running, and set the PCs to 0.
      */
-    safe_add_query(query,
-        dpu_query_build_bit_order_for_control(slice_id,
-            (uint16_t)dpu_pcb_transformation_dpu_to_cpu(&rank->description->configuration.pcb_transformation, config->cpu_to_dpu),
-            (uint16_t)dpu_pcb_transformation_dpu_to_cpu(&rank->description->configuration.pcb_transformation, config->dpu_to_cpu),
-            config->nibble_swap,
-            0x00,
-            &bit_order_result),
-        transaction,
-        status,
-        end);
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
 
-err_query:
-    dpu_transaction_free(transaction);
+    struct _dpu_context_t context;
+    struct _dpu_description_t *description = dpu_get_description(rank);
+
+    uint8_t nr_of_dpu_threads = description->dpu.nr_of_threads;
+
+    context.scheduling = NULL;
+    context.pcs = NULL;
+
+    if ((context.scheduling = malloc(nr_of_dpu_threads * sizeof(*(context.scheduling)))) == NULL) {
+        status = DPU_ERR_SYSTEM;
+        goto end;
+    }
+
+    if ((context.pcs = malloc(nr_of_dpu_threads * sizeof(*(context.pcs)))) == NULL) {
+        status = DPU_ERR_SYSTEM;
+        goto end;
+    }
+
+    for (dpu_thread_t each_thread = 0; each_thread < nr_of_dpu_threads; ++each_thread) {
+        context.scheduling[each_thread] = 0xFF;
+    }
+
+    context.nr_of_running_threads = 0;
+    context.bkp_fault = false;
+    context.dma_fault = false;
+    context.mem_fault = false;
+
+    FF(dpu_initialize_fault_process_for_dpu(dpu, &context));
+
+    dpuinstruction_t stop_instruction = STOPci(BOOT_CC_TRUE, 0);
+
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    dpuinstruction_t *iram_array[DPU_MAX_NR_CIS];
+
+    FF(ufi_select_dpu(rank, &mask, member_id));
+
+    iram_array[slice_id] = &stop_instruction;
+    FF(ufi_iram_write(rank, mask, iram_array, 0, 1));
+
+    for (uint8_t each_thread = 0; each_thread < description->dpu.nr_of_threads; ++each_thread) {
+        FF(ufi_thread_boot(rank, mask, each_thread, NULL));
+    }
+
+    uint8_t result[DPU_MAX_NR_CIS];
+    do {
+        FF(ufi_read_dpu_run(rank, mask, result));
+    } while ((result[slice_id] & mask_one) != 0);
+
+end:
+    free(context.pcs);
+    free(context.scheduling);
+    dpu_unlock_rank(rank);
+    return status;
+}
+
+static dpu_error_t
+dpu_carousel_config(struct dpu_rank_t *rank, const struct dpu_carousel_config *config)
+{
+    LOG_RANK(VERBOSE,
+        rank,
+        "cmd_duration: %d cmd_sampling: %d res_duration: %d res_sampling: %d",
+        config->cmd_duration,
+        config->cmd_sampling,
+        config->res_duration,
+        config->res_sampling);
+
+    dpu_error_t status;
+    uint8_t mask = ALL_CIS;
+
+    FF(ufi_select_all(rank, &mask));
+    FF(ufi_carousel_config(rank, mask, config));
+
+end:
+    return status;
+}
+
+static dpu_error_t
+dpu_ci_shuffling_box_config(struct dpu_rank_t *rank, const struct dpu_bit_config *config)
+{
+    LOG_RANK(
+        VERBOSE, rank, "c2d: 0x%04x, d2c: 0x%04x, nibble_swap: 0x%02x", config->cpu2dpu, config->dpu2cpu, config->nibble_swap);
+    dpu_error_t status;
+    uint8_t mask = ALL_CIS;
+
+    FF(ufi_select_cis(rank, &mask));
+    FF(ufi_bit_config(rank, mask, config, NULL));
+
 end:
     return status;
 }
 
 __API_SYMBOL__ dpu_error_t
-dpu_configure_dma_engine(struct dpu_rank_t *rank, dpu_slice_id_t slice_id, const struct _dpu_dma_engine_configuration_t *config)
+dpu_dma_config(struct dpu_rank_t *rank, const struct dpu_dma_config *config)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_planner_status_e planner_status;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
-
-    LOG_CI(DEBUG,
+    LOG_RANK(VERBOSE,
         rank,
-        slice_id,
         "DMA engine config: refresh_access_number: %d column_read_latency: %d minimal_access_number: %d "
         "default_time_origin: %d ldma_to_sdma_time_origin: %d xdma_time_start_activate: %d "
         "xdma_time_start_access: %d sdma_time_start_wb_f1: %d",
@@ -681,110 +434,155 @@ dpu_configure_dma_engine(struct dpu_rank_t *rank, dpu_slice_id_t slice_id, const
         config->xdma_time_start_activate,
         config->xdma_time_start_access,
         config->sdma_time_start_wb_f1);
+    dpu_error_t status;
 
     uint64_t dma_engine_timing = 0L;
-    dma_engine_timing |= (((uint64_t)config->refresh_access_number) & 0x7FL) << 36;
-    dma_engine_timing |= (((uint64_t)config->column_read_latency) & 0x0FL) << 32;
-    dma_engine_timing |= (((uint64_t)config->minimal_access_number) & 0x07L) << 29;
-    dma_engine_timing |= (((uint64_t)config->default_time_origin) & 0x7FL) << 22;
-    dma_engine_timing |= (((uint64_t)config->ldma_to_sdma_time_origin) & 0x7FL) << 15;
-    dma_engine_timing |= (((uint64_t)config->xdma_time_start_activate) & 0x1FL) << 10;
-    dma_engine_timing |= (((uint64_t)config->xdma_time_start_access) & 0x1FL) << 5;
-    dma_engine_timing |= (((uint64_t)config->sdma_time_start_wb_f1) & 0x1FL) << 0;
+    dma_engine_timing |= (((uint64_t)config->refresh_access_number) & 0x7Ful) << 36u;
+    dma_engine_timing |= (((uint64_t)config->column_read_latency) & 0x0Ful) << 32u;
+    dma_engine_timing |= (((uint64_t)config->minimal_access_number) & 0x07ul) << 29u;
+    dma_engine_timing |= (((uint64_t)config->default_time_origin) & 0x7Ful) << 22u;
+    dma_engine_timing |= (((uint64_t)config->ldma_to_sdma_time_origin) & 0x7Ful) << 15u;
+    dma_engine_timing |= (((uint64_t)config->xdma_time_start_activate) & 0x1Ful) << 10u;
+    dma_engine_timing |= (((uint64_t)config->xdma_time_start_access) & 0x1Ful) << 5u;
+    dma_engine_timing |= (((uint64_t)config->sdma_time_start_wb_f1) & 0x1Ful) << 0u;
 
-    // We suppose that we can configure the DMA engine for ALL dpus (even disabled DPUs)
-    safe_add_query(query, dpu_query_build_select_all_for_control(slice_id), transaction, status, err);
+    uint8_t mask = ALL_CIS;
+    FF(ufi_select_all(rank, &mask));
+
     // Configure DMA Engine Timing
-    DMA_CTRL_WRITE(slice_id, 0x20, (dma_engine_timing >> 0) & 0xFF);
-    DMA_CTRL_WRITE(slice_id, 0x21, (dma_engine_timing >> 8) & 0xFF);
-    DMA_CTRL_WRITE(slice_id, 0x22, (dma_engine_timing >> 16) & 0xFF);
-    DMA_CTRL_WRITE(slice_id, 0x23, (dma_engine_timing >> 24) & 0xFF);
-    DMA_CTRL_WRITE(slice_id, 0x24, (dma_engine_timing >> 32) & 0xFF);
-    DMA_CTRL_WRITE(slice_id, 0x25, (dma_engine_timing >> 40) & 0xFF);
+    FF(ufi_write_dma_ctrl(rank, mask, 0x20, (dma_engine_timing >> 0u) & 0xFFu));
+    FF(ufi_write_dma_ctrl(rank, mask, 0x21, (dma_engine_timing >> 8u) & 0xFFu));
+    FF(ufi_write_dma_ctrl(rank, mask, 0x22, (dma_engine_timing >> 16u) & 0xFFu));
+    FF(ufi_write_dma_ctrl(rank, mask, 0x23, (dma_engine_timing >> 24u) & 0xFFu));
+    FF(ufi_write_dma_ctrl(rank, mask, 0x24, (dma_engine_timing >> 32u) & 0xFFu));
+    FF(ufi_write_dma_ctrl(rank, mask, 0x25, (dma_engine_timing >> 40u) & 0xFFu));
 
     // Clear DMA Engine Configuration Path and flush reg_replace_instr of readop2
-    safe_add_query(query, dpu_query_build_clear_dma_control_for_previous(slice_id), transaction, status, err);
+    FF(ufi_clear_dma_ctrl(rank, mask));
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-
-err:
-    dpu_transaction_free(transaction);
 end:
     return status;
 }
 
 __API_SYMBOL__ dpu_error_t
-dpu_configure_dma_shuffling_box(struct dpu_rank_t *rank, dpu_slice_id_t slice_id, const struct _dpu_pcb_transformation_t *config)
+dpu_dma_shuffling_box_config(struct dpu_rank_t *rank, const struct dpu_bit_config *config)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_planner_status_e planner_status;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
-
-    LOG_CI(DEBUG,
+    LOG_RANK(VERBOSE,
         rank,
-        slice_id,
         "DMA shuffling box config: cpu_to_dpu: 0x%04x dpu_to_cpu: 0x%04x nibble_swap: 0x%02x",
-        config->cpu_to_dpu,
-        config->dpu_to_cpu,
+        config->cpu2dpu,
+        config->dpu2cpu,
         config->nibble_swap);
 
-    // We suppose that we can configure the DMA shuffling box for ALL dpus (even disabled DPUs)
-    safe_add_query(query, dpu_query_build_select_all_for_control(slice_id), transaction, status, err);
+    dpu_error_t status;
+
+    uint8_t mask = ALL_CIS;
+    FF(ufi_select_all(rank, &mask));
+
     // Configure Jedec Shuffling box
-    DMA_CTRL_WRITE(slice_id, 0x10, (config->dpu_to_cpu >> 8) & 0xFF);
-    DMA_CTRL_WRITE(slice_id, 0x11, (config->dpu_to_cpu >> 0) & 0xFF);
-    DMA_CTRL_WRITE(slice_id, 0x12, (config->cpu_to_dpu >> 8) & 0xFF);
-    DMA_CTRL_WRITE(slice_id, 0x13, (config->cpu_to_dpu >> 0) & 0xFF);
-    DMA_CTRL_WRITE(slice_id, 0x14, config->nibble_swap);
+    FF(ufi_write_dma_ctrl(rank, mask, 0x10, (config->dpu2cpu >> 8) & 0xFF));
+    FF(ufi_write_dma_ctrl(rank, mask, 0x11, (config->dpu2cpu >> 0) & 0xFF));
+    FF(ufi_write_dma_ctrl(rank, mask, 0x12, (config->cpu2dpu >> 8) & 0xFF));
+    FF(ufi_write_dma_ctrl(rank, mask, 0x13, (config->cpu2dpu >> 0) & 0xFF));
+    FF(ufi_write_dma_ctrl(rank, mask, 0x14, config->nibble_swap));
+
     // Clear DMA Engine Configuration Path and flush reg_replace_instr of readop2
-    safe_add_query(query, dpu_query_build_clear_dma_control_for_previous(slice_id), transaction, status, err);
+    FF(ufi_clear_dma_ctrl(rank, mask));
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
+end:
+    return status;
+}
 
-err:
-    dpu_transaction_free(transaction);
+static dpu_error_t
+dpu_wavegen_reg_config(struct dpu_rank_t *rank, uint8_t mask, uint8_t address, const struct dpu_wavegen_reg_config *config)
+{
+    dpu_error_t status;
+
+    FF(ufi_write_dma_ctrl(rank, mask, address + 0, config->rise));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 1, config->fall));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 2, config->counter_enable));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 3, config->counter_disable));
+
+end:
+    return status;
+}
+
+static dpu_error_t
+dpu_wavegen_timing_config(struct dpu_rank_t *rank, uint8_t mask, uint8_t address, const struct dpu_wavegen_timing_config *config)
+{
+    dpu_error_t status;
+
+    FF(ufi_write_dma_ctrl(rank, mask, address + 0, config->activate));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 1, config->read));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 2, config->write));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 3, config->precharge));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 4, config->refresh_start));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 5, config->refresh_activ));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 6, config->refresh_prech));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 7, config->refresh_end));
+
+end:
+    return status;
+}
+
+static dpu_error_t
+dpu_wavegen_vector_sampling_config(struct dpu_rank_t *rank,
+    uint8_t mask,
+
+    uint8_t address,
+    const struct dpu_wavegen_vector_sampling_config *config)
+{
+    dpu_error_t status;
+
+    FF(ufi_write_dma_ctrl(rank, mask, address + 0, config->rab_gross));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 1, config->cat_gross));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 2, config->dwbsb_gross));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 3, config->drbsb_gross));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 4, config->drbsb_fine));
+
+end:
+    return status;
+}
+
+static dpu_error_t
+dpu_wavegen_rowhammer_and_refresh_config(struct dpu_rank_t *rank,
+    uint8_t mask,
+    uint8_t address,
+    uint16_t rowhammer_info,
+    uint8_t rowhammer_config)
+{
+    dpu_error_t status;
+
+    FF(ufi_write_dma_ctrl(rank, mask, address + 0, (rowhammer_info >> 0) & 0xFF));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 1, (rowhammer_info >> 8) & 0xFF));
+    FF(ufi_write_dma_ctrl(rank, mask, address + 2, rowhammer_config));
+
 end:
     return status;
 }
 
 __API_SYMBOL__ dpu_error_t
-dpu_configure_waveform_generator(struct dpu_rank_t *rank,
-    dpu_slice_id_t slice_id,
-    const struct _dpu_waveform_generator_configuration_t *config)
+dpu_wavegen_config(struct dpu_rank_t *rank, const struct dpu_wavegen_config *config)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_planner_status_e planner_status;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
+    LOG_RANK(VERBOSE, rank, "");
+    dpu_error_t status;
 
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
+    uint8_t mask = ALL_CIS;
+    FF(ufi_select_all(rank, &mask));
 
-    // We suppose that we can configure the waveform generator for ALL dpus (even disabled DPUs)
-    safe_add_query(query, dpu_query_build_select_all_for_control(slice_id), transaction, status, err);
+    FF(dpu_wavegen_reg_config(rank, mask, 0xC0, &config->MCBAB));
+    FF(dpu_wavegen_reg_config(rank, mask, 0xC4, &config->RCYCLKB));
+    FF(dpu_wavegen_reg_config(rank, mask, 0xC8, &config->WCYCLKB));
+    FF(dpu_wavegen_reg_config(rank, mask, 0xCC, &config->DWCLKB));
+    FF(dpu_wavegen_reg_config(rank, mask, 0xD0, &config->DWAEB));
+    FF(dpu_wavegen_reg_config(rank, mask, 0xD4, &config->DRAPB));
+    FF(dpu_wavegen_reg_config(rank, mask, 0xD8, &config->DRAOB));
+    FF(dpu_wavegen_reg_config(rank, mask, 0xDC, &config->DWBSB_EN));
 
-    WAVEGEN_REG_CONFIG(slice_id, config->MCBAB, 0xC0);
-    WAVEGEN_REG_CONFIG(slice_id, config->RCYCLKB, 0xC4);
-    WAVEGEN_REG_CONFIG(slice_id, config->WCYCLKB, 0xC8);
-    WAVEGEN_REG_CONFIG(slice_id, config->DWCLKB, 0xCC);
-    WAVEGEN_REG_CONFIG(slice_id, config->DWAEB, 0xD0);
-    WAVEGEN_REG_CONFIG(slice_id, config->DRAPB, 0xD4);
-    WAVEGEN_REG_CONFIG(slice_id, config->DRAOB, 0xD8);
-    WAVEGEN_REG_CONFIG(slice_id, config->DWBSB_EN, 0xDC);
-    WAVEGEN_TIMING_CONFIG(slice_id, config->timing_completion, 0xE0);
-    WAVEGEN_VECTOR_SAMPLING_CONFIG(slice_id, config->vector_sampling, 0xE8);
-    WAVEGEN_ROWHAMMER_AND_REFRESH_CONFIG(slice_id, config->refresh_and_row_hammer_info, 0xFC); // Row Hammer Info
-    WAVEGEN_ROWHAMMER_CONFIG(slice_id, config->row_hammer_config, 0xFE);
+    FF(dpu_wavegen_timing_config(rank, mask, 0xE0, &config->timing_completion));
+    FF(dpu_wavegen_vector_sampling_config(rank, mask, 0xE8, &config->vector_sampling));
+    FF(dpu_wavegen_rowhammer_and_refresh_config(
+        rank, mask, 0xFC, config->refresh_and_row_hammer_info, config->row_hammer_config));
 
     for (dpu_member_id_t each_dpu = 0; each_dpu < rank->description->topology.nr_of_dpus_per_control_interface; ++each_dpu) {
         // Configuration MUST start with dpu_id = 4 because of refresh
@@ -795,186 +593,42 @@ dpu_configure_waveform_generator(struct dpu_rank_t *rank,
         else
             target_dpu = (each_dpu >= 4) ? (each_dpu - 4) : (each_dpu + 4);
 
-        safe_add_query(query, dpu_query_build_select_dpu_for_control(slice_id, target_dpu), transaction, status, err);
-
-        // DPU Takes control of MRAM REFRESH (Note: in ASIC only, waveFormGen config shall start with dpu_id = 4)
-        DMA_CTRL_WRITE(slice_id, 0x83, 0x01); // dpu_ref_ctrl
-
-        // Clear WaveForm Generator Configuration Path and flush reg_replace_instr of readop2
-        safe_add_query(query, dpu_query_build_clear_dma_control_for_previous(slice_id), transaction, status, err);
+        mask = ALL_CIS;
+        FF(ufi_select_dpu(rank, &mask, target_dpu));
+        FF(ufi_write_dma_ctrl(rank, mask, 0x83, 0x01));
+        FF(ufi_clear_dma_ctrl(rank, mask));
     }
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-
-err:
-    dpu_transaction_free(transaction);
 end:
     return status;
 }
 
 __API_SYMBOL__ dpu_error_t
-dpu_waveform_generator_read_status(struct dpu_t *dpu, uint8_t read_addr, uint8_t *read_value)
+dpu_wavegen_read_status(struct dpu_t *dpu, uint8_t address, uint8_t *value)
 {
-    LOG_DPU(VERBOSE, dpu, "%d", read_addr);
+    LOG_DPU(VERBOSE, dpu, "%d", address);
 
     if (!dpu->enabled) {
         return DPU_ERR_DPU_DISABLED;
     }
 
-    dpu_transaction_t transaction;
     dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
 
-    struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t member_id = dpu->dpu_id;
+    struct dpu_rank_t *rank = dpu->rank;
+    uint8_t mask = CI_MASK_ONE(dpu->slice_id);
+    uint8_t results[DPU_MAX_NR_CIS];
 
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
+    dpu_lock_rank(rank);
 
-    safe_add_query(query, dpu_query_build_select_dpu_for_control(slice_id, member_id), transaction, status, err);
+    FF(ufi_select_dpu(rank, &mask, dpu->dpu_id));
+    FF(ufi_write_dma_ctrl(rank, mask, 0xFF, address & 3));
+    FF(ufi_clear_dma_ctrl(rank, mask));
+    FF(ufi_read_dma_ctrl(rank, mask, results));
 
-    DMA_CTRL_WRITE(slice_id, 0xFF, read_addr & 0x3);
-    // Clear WaveForm Generator Configuration Path and flush reg_replace_instr of readop2
-    safe_add_query(query, dpu_query_build_clear_dma_control_for_previous(slice_id), transaction, status, err);
-    safe_add_query(query, dpu_query_build_read_dma_control_for_previous(slice_id, read_value), transaction, status, err);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
+    *value = results[dpu->slice_id];
 
-err:
-    dpu_transaction_free(transaction);
 end:
-    return status;
-}
-
-__API_SYMBOL__ dpu_error_t
-dpu_configure_iram_repair_for_previous(struct dpu_rank_t *rank,
-    dpu_slice_id_t slice_id,
-    uint8_t AB_msbs,
-    uint8_t A_lsbs,
-    uint8_t B_lsbs,
-    uint8_t CD_msbs,
-    uint8_t C_lsbs,
-    uint8_t D_lsbs,
-    uint8_t even_index,
-    uint8_t odd_index)
-{
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_transaction_t transaction;
-    dpu_error_t status = DPU_OK;
-    dpu_planner_status_e planner_status;
-    dpu_query_t query;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
-
-    safe_add_query(query,
-        dpu_query_build_irepair_AB_configuration_for_previous(slice_id, A_lsbs, B_lsbs, AB_msbs),
-        transaction,
-        status,
-        err);
-    safe_add_query(query,
-        dpu_query_build_irepair_CD_configuration_for_previous(slice_id, C_lsbs, D_lsbs, CD_msbs),
-        transaction,
-        status,
-        err);
-    safe_add_query(query,
-        dpu_query_build_irepair_OE_configuration_for_previous(slice_id, even_index, odd_index, IRAM_TIMING_SAFE_VALUE),
-        transaction,
-        status,
-        err);
-    safe_add_query(query,
-        dpu_query_build_register_file_timing_configuration_for_previous(slice_id, RFRAM_TIMING_SAFE_VALUE),
-        transaction,
-        status,
-        err);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-
-err:
-    dpu_transaction_free(transaction);
-end:
-    return status;
-}
-
-__API_SYMBOL__ dpu_error_t
-dpu_configure_wram_repair_for_previous(struct dpu_rank_t *rank,
-    dpu_slice_id_t slice_id,
-    uint8_t wram_bank_index,
-    uint8_t AB_msbs,
-    uint8_t A_lsbs,
-    uint8_t B_lsbs,
-    uint8_t CD_msbs,
-    uint8_t C_lsbs,
-    uint8_t D_lsbs,
-    uint8_t even_index,
-    uint8_t odd_index)
-{
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_transaction_t transaction;
-    dpu_error_t status = DPU_OK;
-    dpu_planner_status_e planner_status;
-    dpu_query_t query;
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
-
-    dpu_dma_ctrl_t wram_bank_addr = (dpu_dma_ctrl_t)(0x60 | (wram_bank_index << 2));
-
-    // Configure WRAM Bank Even & Odd bits
-    safe_add_query(query,
-        dpu_query_build_write_dma_control_for_previous(
-            slice_id, wram_bank_addr, 0x60, 0x60 | (even_index >> 1), 0x60 | (odd_index >> 1), 0x60, 0x40),
-        transaction,
-        status,
-        err);
-    // Configure WRAM Bank AB Address[11:4]
-    safe_add_query(query,
-        dpu_query_build_write_dma_control_for_previous(
-            slice_id, wram_bank_addr, 0x61, 0x60 | (AB_msbs >> 4), 0x60 | (AB_msbs & 0xF), 0x60, 0x40),
-        transaction,
-        status,
-        err);
-    // Configure WRAM Bank A Address[3:0] and B Address[3:0]
-    safe_add_query(query,
-        dpu_query_build_write_dma_control_for_previous(slice_id, wram_bank_addr, 0x62, 0x60 | A_lsbs, 0x60 | B_lsbs, 0x60, 0x40),
-        transaction,
-        status,
-        err);
-    // Configure WRAM Bank CD Address[11:4]
-    safe_add_query(query,
-        dpu_query_build_write_dma_control_for_previous(
-            slice_id, wram_bank_addr, 0x63, 0x60 | (CD_msbs >> 4), 0x60 | (CD_msbs & 0xF), 0x60, 0x40),
-        transaction,
-        status,
-        err);
-    // Configure WRAM Bank C Address[3:0] and D Address[3:0]
-    safe_add_query(query,
-        dpu_query_build_write_dma_control_for_previous(slice_id, wram_bank_addr, 0x64, 0x60 | C_lsbs, 0x60 | D_lsbs, 0x60, 0x40),
-        transaction,
-        status,
-        err);
-    // Configure WRAM Bank Timing to safe value
-    safe_add_query(query,
-        dpu_query_build_write_dma_control_for_previous(
-            slice_id, wram_bank_addr, 0x65, 0x60, 0x60 | WRAM_TIMING_SAFE_VALUE, 0x60, 0x40),
-        transaction,
-        status,
-        err);
-    // Clear WRAM Bank Configuration Path and flush reg_replace_instr of readop2
-    safe_add_query(query, dpu_query_build_clear_dma_control_for_previous(slice_id), transaction, status, err);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-
-err:
-    dpu_transaction_free(transaction);
-end:
+    dpu_unlock_rank(rank);
     return status;
 }
 
@@ -996,14 +650,22 @@ dpu_host_release_access_for_dpu(struct dpu_t *dpu)
     LOG_DPU(VERBOSE, dpu, "");
 
     dpu_error_t status = DPU_OK;
-    dpu_transaction_t transaction;
 
     struct dpu_rank_t *rank = dpu_get_rank(dpu);
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t dpu_id = dpu->dpu_id;
 
     dpu_member_id_t dpu_pair_base_id = (dpu_member_id_t)(dpu_id & ~1);
-    struct dpu_t *pair_base_dpu = dpu_get(rank, slice_id, dpu_pair_base_id);
+    struct dpu_t *pair_base_dpu = DPU_GET_UNSAFE(rank, slice_id, dpu_pair_base_id);
+
+    if (rank->runtime.run_context.nb_dpu_running > 0) {
+        LOG_RANK(WARNING,
+            rank,
+            "Host can not get access to the MRAM because %u DPU%s running.",
+            rank->runtime.run_context.nb_dpu_running,
+            rank->runtime.run_context.nb_dpu_running > 1 ? "s are" : " is");
+        return DPU_ERR_MRAM_BUSY;
+    }
 
     /* Stores the state of the mux in case the debugger intervenes: we record the state before
      * actually placing the mux in this state. If we did record the state after setting the mux,
@@ -1021,31 +683,14 @@ dpu_host_release_access_for_dpu(struct dpu_t *dpu)
          */
         return DPU_OK;
 
-    if (rank->runtime.run_context.nb_dpu_running > 0) {
-        LOG_RANK(WARNING,
-            rank,
-            "Host can not get access to the MRAM because %u DPU%s running.",
-            rank->runtime.run_context.nb_dpu_running,
-            rank->runtime.run_context.nb_dpu_running > 1 ? "s are" : " is");
-        return DPU_ERR_MRAM_BUSY;
-    }
-
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL)
-        return DPU_ERR_SYSTEM;
-
-    status = host_release_access(transaction, pair_base_dpu);
-    if (status != DPU_OK)
-        goto err;
+    FF(host_release_access_for_dpu(pair_base_dpu));
 
     if ((dpu_pair_base_id + 1) < rank->description->topology.nr_of_dpus_per_control_interface) {
-        struct dpu_t *paired_dpu = dpu_get(rank, slice_id, (dpu_member_id_t)(dpu_pair_base_id + 1));
-        status = host_release_access(transaction, paired_dpu);
-        if (status != DPU_OK)
-            goto err;
+        struct dpu_t *paired_dpu = DPU_GET_UNSAFE(rank, slice_id, (dpu_member_id_t)(dpu_pair_base_id + 1));
+        FF(host_release_access_for_dpu(paired_dpu));
     }
 
-err:
-    dpu_transaction_free(transaction);
+end:
     return status;
 }
 
@@ -1059,10 +704,18 @@ dpu_host_get_access_for_dpu(struct dpu_t *dpu)
     dpu_slice_id_t slice_id = dpu->slice_id;
     dpu_member_id_t dpu_id = dpu->dpu_id;
 
-    dpu_error_t status = DPU_OK;
-    dpu_transaction_t transaction;
+    dpu_error_t status;
     dpu_member_id_t dpu_pair_base_id = (dpu_member_id_t)(dpu_id & ~1);
-    struct dpu_t *pair_base_dpu = dpu_get(rank, slice_id, dpu_pair_base_id);
+    struct dpu_t *pair_base_dpu = DPU_GET_UNSAFE(rank, slice_id, dpu_pair_base_id);
+
+    if (rank->runtime.run_context.nb_dpu_running > 0) {
+        LOG_RANK(WARNING,
+            rank,
+            "Host can not get access to the MRAM because %u DPU%s running.",
+            rank->runtime.run_context.nb_dpu_running,
+            rank->runtime.run_context.nb_dpu_running > 1 ? "s are" : " is");
+        return DPU_ERR_MRAM_BUSY;
+    }
 
     /* Stores the state of the mux in case the debugger intervenes: we record the state before
      * actually placing the mux in this state. If we did record the state after setting the mux,
@@ -1080,34 +733,126 @@ dpu_host_get_access_for_dpu(struct dpu_t *dpu)
          */
         return DPU_OK;
 
+    FF(host_get_access_for_dpu(pair_base_dpu));
+
+    if ((dpu_pair_base_id + 1) < rank->description->topology.nr_of_dpus_per_control_interface) {
+        struct dpu_t *paired_dpu = DPU_GET_UNSAFE(rank, slice_id, (dpu_member_id_t)(dpu_pair_base_id + 1));
+        FF(host_get_access_for_dpu(paired_dpu));
+    }
+
+end:
+    return status;
+}
+
+__API_SYMBOL__ dpu_error_t
+dpu_host_release_access_for_rank(struct dpu_rank_t *rank)
+{
+    LOG_RANK(VERBOSE, rank, "");
+
+    dpu_error_t status = DPU_OK;
+
+    dpu_lock_rank(rank);
+
+    dpu_description_t desc = rank->description;
+    dpu_member_id_t dpu_pair_base_id;
+    uint8_t nr_cis = desc->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus = desc->topology.nr_of_dpus_per_control_interface;
+
     if (rank->runtime.run_context.nb_dpu_running > 0) {
         LOG_RANK(WARNING,
             rank,
             "Host can not get access to the MRAM because %u DPU%s running.",
             rank->runtime.run_context.nb_dpu_running,
             rank->runtime.run_context.nb_dpu_running > 1 ? "s are" : " is");
-        return DPU_ERR_MRAM_BUSY;
+        status = DPU_ERR_MRAM_BUSY;
+        goto end;
     }
 
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL)
-        return DPU_ERR_SYSTEM;
-
-    status = host_get_access(transaction, pair_base_dpu);
-    if (status != DPU_OK)
-        goto err;
-
-    if ((dpu_pair_base_id + 1) < rank->description->topology.nr_of_dpus_per_control_interface) {
-        struct dpu_t *paired_dpu = dpu_get(rank, slice_id, (dpu_member_id_t)(dpu_pair_base_id + 1));
-        status = host_get_access(transaction, paired_dpu);
-        if (status != DPU_OK)
-            goto err;
+    /* Stores the state of the mux in case the debugger intervenes: we record the state before
+     * actually placing the mux in this state. If we did record the state after setting the mux,
+     * we could be interrupted between the setting of the mux and the recording of the state, and
+     * then the debugger would miss a mux state.
+     */
+    for (dpu_slice_id_t each_slice = 0; each_slice < nr_cis; ++each_slice) {
+        for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus; ++each_dpu) {
+            dpu_pair_base_id = (dpu_member_id_t)(each_dpu & ~1);
+            __dpu_clear_host_mux_mram_state(rank, each_slice, dpu_pair_base_id);
+            if ((dpu_pair_base_id + 1) < rank->description->topology.nr_of_dpus_per_control_interface)
+                __dpu_clear_host_mux_mram_state(rank, each_slice, dpu_pair_base_id + 1);
+        }
     }
 
-err:
-    dpu_transaction_free(transaction);
+    if (!rank->description->configuration.api_must_switch_mram_mux && !rank->description->configuration.init_mram_mux) {
+        /*
+         * Yes, this is not an error, that just means that the following configuration should not be done since
+         * it is useless and incorrect.
+         */
+        status = DPU_OK;
+        goto end;
+    }
+
+    FF(host_release_access_for_rank(rank));
+
+end:
+    dpu_unlock_rank(rank);
+
     return status;
 }
 
+__API_SYMBOL__ dpu_error_t
+dpu_host_get_access_for_rank(struct dpu_rank_t *rank)
+{
+    LOG_RANK(VERBOSE, rank, "");
+
+    dpu_error_t status = DPU_OK;
+
+    dpu_lock_rank(rank);
+
+    dpu_description_t desc = rank->description;
+    dpu_member_id_t dpu_pair_base_id;
+    uint8_t nr_cis = desc->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus = desc->topology.nr_of_dpus_per_control_interface;
+
+    if (rank->runtime.run_context.nb_dpu_running > 0) {
+        LOG_RANK(WARNING,
+            rank,
+            "Host can not get access to the MRAM because %u DPU%s running.",
+            rank->runtime.run_context.nb_dpu_running,
+            rank->runtime.run_context.nb_dpu_running > 1 ? "s are" : " is");
+        status = DPU_ERR_MRAM_BUSY;
+        goto end;
+    }
+
+    /* Stores the state of the mux in case the debugger intervenes: we record the state before
+     * actually placing the mux in this state. If we did record the state after setting the mux,
+     * we could be interrupted between the setting of the mux and the recording of the state, and
+     * then the debugger would miss a mux state.
+     */
+    for (dpu_slice_id_t each_slice = 0; each_slice < nr_cis; ++each_slice) {
+        for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus; ++each_dpu) {
+            dpu_pair_base_id = (dpu_member_id_t)(each_dpu & ~1);
+            __dpu_set_host_mux_mram_state(rank, each_slice, dpu_pair_base_id);
+            if ((dpu_pair_base_id + 1) < rank->description->topology.nr_of_dpus_per_control_interface)
+                __dpu_set_host_mux_mram_state(rank, each_slice, dpu_pair_base_id + 1);
+        }
+    }
+
+    if (!rank->description->configuration.api_must_switch_mram_mux && !rank->description->configuration.init_mram_mux) {
+        /*
+         * Yes, this is not an error, that just means that the following configuration should not be done since
+         * it is useless and incorrect.
+         */
+        status = DPU_OK;
+        goto end;
+    }
+
+    FF(host_get_access_for_rank(rank));
+
+end:
+    dpu_unlock_rank(rank);
+
+    return status;
+}
 static bool
 byte_order_values_are_compatible(uint64_t reference, uint64_t found)
 {
@@ -1122,175 +867,155 @@ byte_order_values_are_compatible(uint64_t reference, uint64_t found)
 }
 
 static dpu_error_t
-dpu_byte_order(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id, uint64_t *byte_order_result)
+dpu_byte_order(struct dpu_rank_t *rank)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
+    LOG_RANK(VERBOSE, rank, "");
+    dpu_error_t status;
+    uint64_t byte_order_results[DPU_MAX_NR_CIS];
+    uint8_t mask = ALL_CIS;
 
-    safe_add_query(query, dpu_query_build_byte_order_for_control(slice_id, byte_order_result), transaction, status, end);
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
+    FF(ufi_select_cis(rank, &mask));
+    FF(ufi_byte_order(rank, mask, byte_order_results));
 
-    if (!byte_order_values_are_compatible(*byte_order_result, EXPECTED_BYTE_ORDER_RESULT_AFTER_CONFIGURATION)) {
-        LOG_CI(WARNING,
-            rank,
-            slice_id,
-            "ERROR: invalid byte order (reference: 0x%016lx; found: 0x%016lx)",
-            EXPECTED_BYTE_ORDER_RESULT_AFTER_CONFIGURATION,
-            *byte_order_result);
-        status = DPU_ERR_DRIVER;
-        goto err_query;
-    }
+    for (dpu_slice_id_t slice_id = 0; slice_id < rank->description->topology.nr_of_control_interfaces; ++slice_id) {
+        if (!CI_MASK_ON(mask, slice_id))
+            continue;
 
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-end:
-    return status;
-}
-
-static dpu_error_t
-dpu_software_reset(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id, bool param_is_null)
-{
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    dpu_rank_status_e rank_status;
-    dpu_clock_division_t clock_division
-        = param_is_null ? 0 : from_division_factor_to_dpu_enum(rank->description->timings.clock_division);
-    uint8_t cycle_accurate = (uint8_t)((rank->description->configuration.enable_cycle_accurate_behavior == true) ? 1 : 0);
-
-    safe_add_query(
-        query, dpu_query_build_software_reset_for_control(slice_id, cycle_accurate, clock_division), transaction, status, end);
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-
-    // Software Reset has been sent. We need to wait "some time" before we can continue (~ 20 clock cycles)
-    // For simulator backends, we need to run the simulation. We suppose that these function calls will be long enough
-    // to put a real hardware backend in a stable state.
-    uint64_t *buffer;
-    uint32_t reset_duration = rank->description->timings.reset_wait_duration;
-
-    buffer = malloc(rank->description->topology.nr_of_control_interfaces * sizeof(uint64_t));
-    if (!buffer) {
-        status = DPU_ERR_SYSTEM;
-        goto err_query;
-    }
-
-    /* This is needed for some driver backends that avoid to read control interface if no commands were
-     * sent before: by memsetting at a value != 0, we force the control interface reading.
-     */
-    memset(buffer, 0xFF, rank->description->topology.nr_of_control_interfaces * sizeof(uint64_t));
-
-    switch (clock_division) {
-        case DPU_CLOCK_DIV8:
-            reset_duration *= 4;
-            break;
-        case DPU_CLOCK_DIV4:
-            reset_duration *= 2;
-            break;
-        case DPU_CLOCK_DIV3:
-            reset_duration = reset_duration * 3 / 2;
-            break;
-        default /*DPU_CLOCK_DIV2*/:
-            break;
-    }
-
-    for (uint32_t reset_duration_iteration = 0; reset_duration_iteration < reset_duration; ++reset_duration_iteration) {
-        if ((rank_status = rank->handler_context->handler->update_commands(rank, &buffer)) != DPU_RANK_SUCCESS) {
-            status = map_rank_status_to_api_status(rank_status);
-            goto err_query;
+        if (!byte_order_values_are_compatible(byte_order_results[slice_id], EXPECTED_BYTE_ORDER_RESULT_AFTER_CONFIGURATION)) {
+            LOG_CI(WARNING,
+                rank,
+                slice_id,
+                "ERROR: invalid byte order (reference: 0x%016lx; found: 0x%016lx)",
+                EXPECTED_BYTE_ORDER_RESULT_AFTER_CONFIGURATION,
+                byte_order_results[slice_id]);
+            status = DPU_ERR_DRIVER;
         }
     }
 
-    /* Reset the color of the slice */
-    rank->runtime.control_interface.color &= ~(1 << slice_id);
-    rank->runtime.control_interface.fault_collide &= ~(1 << slice_id);
-    rank->runtime.control_interface.fault_decode &= ~(1 << slice_id);
+end:
+    return status;
+}
 
-    free(buffer);
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+static const char *
+clock_division_to_string(dpu_clock_division_t clock_division)
+{
+    switch (clock_division) {
+        case DPU_CLOCK_DIV8:
+            return "CLOCK DIV 8";
+        case DPU_CLOCK_DIV4:
+            return "CLOCK DIV 4";
+        case DPU_CLOCK_DIV3:
+            return "CLOCK DIV 3";
+        case DPU_CLOCK_DIV2:
+            return "CLOCK DIV 2";
+        default:
+            return "CLOCK DIV UNKNOWN";
+    }
+}
+
+static dpu_error_t
+dpu_soft_reset(struct dpu_rank_t *rank, dpu_clock_division_t clock_division)
+{
+    LOG_RANK(VERBOSE, rank, "%s", clock_division_to_string(clock_division));
+    dpu_error_t status;
+
+    uint8_t cycle_accurate = rank->description->configuration.enable_cycle_accurate_behavior ? 1 : 0;
+    uint8_t mask = ALL_CIS;
+
+    FF(ufi_select_cis(rank, &mask));
+    ufi_soft_reset(rank, mask, clock_division, cycle_accurate);
+
 end:
     return status;
 }
 
 static dpu_error_t
-dpu_bit_order(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id, uint64_t byte_order_result)
+dpu_bit_config(struct dpu_rank_t *rank, struct dpu_bit_config *config)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
+    LOG_RANK(VERBOSE, rank, "");
     dpu_error_t status;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t bit_order_result;
 
-    /* 1/ Send a "NULL" bit order command */
-    safe_add_query(
-        query, dpu_query_build_bit_order_for_control(slice_id, 0, 0, 0, 0, &bit_order_result), transaction, status, end);
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
+    uint32_t bit_config_results[DPU_MAX_NR_CIS];
+    uint8_t mask = ALL_CIS;
 
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    FF(ufi_select_cis(rank, &mask));
+    FF(ufi_bit_config(rank, mask, NULL, bit_config_results));
 
-    /* 2/ Then, from byte_order_result and bit_order_result, compute the necessary "transformation" from
-     * dpu to cpu and cpu to dpu and insert the result into a new bit order command.
-     */
-    dpu_pcb_transformation_fill(bit_order_result, &rank->description->configuration.pcb_transformation);
+    uint32_t bit_config_result = bit_config_results[__builtin_ctz(mask)];
 
-    LOG_CI(DEBUG,
-        rank,
-        slice_id,
-        "byte_order: 0x%016lx bit_order: 0x%08x nibble_swap: 0x%02x cpu_to_dpu: 0x%04x dpu_to_cpu: 0x%04x",
-        byte_order_result,
-        bit_order_result,
-        rank->description->configuration.pcb_transformation.nibble_swap,
-        rank->description->configuration.pcb_transformation.cpu_to_dpu,
-        rank->description->configuration.pcb_transformation.dpu_to_cpu);
+    /* Let's verify that all CIs have the bit config result as the first CI. */
+    for (dpu_slice_id_t slice_id = 0; slice_id < rank->description->topology.nr_of_control_interfaces; ++slice_id) {
+        if (!CI_MASK_ON(mask, slice_id))
+            continue;
 
-    if ((status = dpu_configure_ci_shuffling_box(rank, slice_id, &rank->description->configuration.pcb_transformation))
-        != DPU_OK) {
-        goto err_query;
+        if (bit_config_results[slice_id] != bit_config_result) {
+            LOG_RANK(WARNING,
+                rank,
+                "inconsistent bit configuration between the different CIs (0x%08x != 0x%08x)",
+                bit_config_results[slice_id],
+                bit_config_result);
+            status = DPU_ERR_INTERNAL;
+            goto end;
+        }
     }
 
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    dpu_bit_config_compute(bit_config_result, config);
+
+    config->stutter = 0;
+
+    LOG_RANK(DEBUG,
+        rank,
+        "bit_order: 0x%08x nibble_swap: 0x%02x cpu_to_dpu: 0x%04x dpu_to_cpu: 0x%04x",
+        bit_config_result,
+        config->nibble_swap,
+        config->cpu2dpu,
+        config->dpu2cpu);
+
 end:
     return status;
 }
 
 static dpu_error_t
-dpu_identity(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id)
+dpu_identity(struct dpu_rank_t *rank)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t identity_result;
+    LOG_RANK(VERBOSE, rank, "");
+    dpu_error_t status;
+    uint32_t identity_results[DPU_MAX_NR_CIS];
+    uint8_t mask = ALL_CIS;
 
-    safe_add_query(query, dpu_query_build_identity_for_control(slice_id, &identity_result), transaction, status, end);
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
+    FF(ufi_select_cis(rank, &mask));
+    FF(ufi_identity(rank, mask, identity_results));
 
-    /* No shuffling boxes, so the result must be software-shuffled */
-    dpu_chip_id_e identity_found
-        = (dpu_chip_id_e)dpu_pcb_transformation_cpu_to_dpu(&rank->description->configuration.pcb_transformation, identity_result);
+    uint32_t identity_result = identity_results[__builtin_ctz(mask)];
+    for (dpu_slice_id_t slice_id = 0; slice_id < rank->description->topology.nr_of_control_interfaces; ++slice_id) {
+        if (!CI_MASK_ON(mask, slice_id))
+            continue;
 
-    if (identity_found != rank->description->signature.chip_id) {
-        LOG_CI(WARNING,
+        if (identity_results[slice_id] != identity_result) {
+            LOG_RANK(WARNING,
+                rank,
+                "inconsistent identity between the different CIs (0x%08x != 0x%08x)",
+                identity_results[slice_id],
+                identity_result);
+            status = DPU_ERR_INTERNAL;
+            goto end;
+        }
+    }
+
+    if (identity_result != rank->description->signature.chip_id) {
+        LOG_RANK(WARNING,
             rank,
-            slice_id,
             "ERROR: invalid identity (expected: 0x%08x; found: 0x%08x)",
             rank->description->signature.chip_id,
-            identity_found);
+            identity_result);
         status = DPU_ERR_INTERNAL;
-        goto err_query;
     }
 
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
 end:
     return status;
 }
 
-static dpu_temperature_e
+static enum dpu_temperature
 from_celsius_to_dpu_enum(uint8_t temperature)
 {
     if (temperature < 50)
@@ -1312,59 +1037,60 @@ from_celsius_to_dpu_enum(uint8_t temperature)
 }
 
 static dpu_error_t
-dpu_thermal_config(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id)
+dpu_thermal_config(struct dpu_rank_t *rank, uint8_t thermal_config)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
+    enum dpu_temperature temperature = from_celsius_to_dpu_enum(thermal_config);
+    dpu_error_t status;
+    LOG_RANK(VERBOSE, rank, "%d°C (value: 0x%04x)", thermal_config, temperature);
+    uint8_t mask = ALL_CIS;
 
-    dpu_temperature_e temperature = from_celsius_to_dpu_enum(rank->description->timings.std_temperature);
-
-    LOG_CI(DEBUG,
-        rank,
-        slice_id,
-        "thermal threshold set at %d°C (value: 0x%04x)",
-        rank->description->timings.std_temperature,
-        temperature);
-
-    safe_add_query(query, dpu_query_build_thermal_configuration_for_control(slice_id, temperature), transaction, status, end);
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    FF(ufi_select_cis(rank, &mask));
+    ufi_thermal_config(rank, mask, temperature);
 end:
     return status;
 }
 
 static dpu_error_t
-dpu_set_group(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id)
+dpu_init_groups(struct dpu_rank_t *rank, const bool *all_dpus_are_enabled_save, const dpu_selected_mask_t *enabled_dpus_save)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
+    LOG_RANK(VERBOSE, rank, "");
     dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
 
-    if (rank->runtime.control_interface.slice_info[slice_id].all_dpus_are_enabled) {
-        safe_add_query(query, dpu_query_build_select_all_for_control(slice_id), transaction, status, err_query);
-        safe_add_query(query, dpu_query_build_write_group_for_previous(slice_id, DPU_ENABLED_GROUP), transaction, status, end);
-    } else {
-        uint8_t nr_dpus = rank->description->topology.nr_of_dpus_per_control_interface;
-        for (int each_dpu = 0; each_dpu < nr_dpus; ++each_dpu) {
-            if (dpu_get(rank, slice_id, each_dpu)->enabled) {
-                safe_add_query(
-                    query, dpu_query_build_write_group_for_dpu(slice_id, each_dpu, DPU_ENABLED_GROUP), transaction, status, end);
-            } else {
-                safe_add_query(
-                    query, dpu_query_build_write_group_for_dpu(slice_id, each_dpu, DPU_DISABLED_GROUP), transaction, status, end);
+    uint8_t nr_cis = rank->description->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus_per_ci = rank->description->topology.nr_of_dpus_per_control_interface;
+
+    uint8_t ci_mask = 0;
+
+    for (dpu_slice_id_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
+        if (all_dpus_are_enabled_save[each_ci]) {
+            ci_mask |= CI_MASK_ONE(each_ci);
+        } else if (enabled_dpus_save[each_ci]) {
+            for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
+                uint8_t single_ci_mask = CI_MASK_ONE(each_ci);
+                uint8_t group = ((enabled_dpus_save[each_ci] & (1 << each_dpu)) != 0) ? DPU_ENABLED_GROUP : DPU_DISABLED_GROUP;
+                FF(ufi_select_dpu(rank, &single_ci_mask, each_dpu));
+                FF(ufi_write_group(rank, single_ci_mask, group));
             }
         }
     }
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
+    if (ci_mask != 0) {
+        FF(ufi_select_all(rank, &ci_mask));
+        FF(ufi_write_group(rank, ci_mask, DPU_ENABLED_GROUP));
+    }
 
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+    /* Set the rank context with the saved context */
+    for (dpu_slice_id_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
+        struct dpu_configuration_slice_info_t *ci_info = &rank->runtime.control_interface.slice_info[each_ci];
+
+        ci_info->all_dpus_are_enabled = all_dpus_are_enabled_save[each_ci];
+        ci_info->enabled_dpus = enabled_dpus_save[each_ci];
+
+        for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus_per_ci; ++each_dpu) {
+            DPU_GET_UNSAFE(rank, each_ci, each_dpu)->enabled = (ci_info->enabled_dpus & (1 << each_dpu)) != 0;
+        }
+    }
+
 end:
     return status;
 }
@@ -1372,356 +1098,202 @@ end:
 // TODO: Should find a way to tell upper layers that iram repair took place if any.
 /* This function fails if only ONE DPU is impossible to repair. */
 static dpu_error_t
-dpu_check_for_iram_repair(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id)
+dpu_iram_repair_config(struct dpu_rank_t *rank)
 {
-    dpu_planner_status_e planner_status;
     dpu_error_t status;
-    dpu_query_t query;
-    dpu_member_id_t dpu_id;
 
     if (rank->description->configuration.do_iram_repair) {
-        LOG_CI(VERBOSE, rank, slice_id, "IRAM repair enabled");
-        /* 1/ Fill the IRAM with "0", and read it back: if any bit is stuck at "1" => fix this problem. */
-        status = find_faulty_iram_bits_blocked_at(transaction, rank, slice_id, false);
-        if (status != DPU_OK)
-            goto err;
-
-        /* 2/ Fill the IRAM with "1", and read it back: if any bit is stuck at "0" => fix this problem. */
-        status = find_faulty_iram_bits_blocked_at(transaction, rank, slice_id, true);
-        if (status != DPU_OK)
-            goto err;
-
-        for (dpu_id = 0; dpu_id < rank->description->topology.nr_of_dpus_per_control_interface; ++dpu_id) {
-            struct dpu_t *dpu = dpu_get(rank, slice_id, dpu_id);
-            status = try_to_repair_iram(transaction, dpu);
-            if (status != DPU_OK)
-                goto err;
-        }
+        LOG_RANK(VERBOSE, rank, "IRAM repair enabled");
+        // SRAM defects were filled at rank allocation
+        FF(try_to_repair_iram(rank));
     } else {
         // Default configuration
-        LOG_CI(VERBOSE, rank, slice_id, "IRAM repair disabled");
-        build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err);
-        safe_execute_transaction(transaction, rank, planner_status, status, err);
-        status = dpu_configure_iram_repair_for_previous(rank, slice_id, 0, 0, 0, 0, 0, 0, 0, 1);
-        if (status != DPU_OK)
-            goto err;
+        LOG_RANK(VERBOSE, rank, "IRAM repair disabled");
+        struct dpu_repair_config config = { 0, 0, 0, 0, 0, 0, 0, 1 };
+        struct dpu_repair_config *config_array[DPU_MAX_NR_CIS] = { [0 ... DPU_MAX_NR_CIS - 1] = &config };
+
+        uint8_t mask = ALL_CIS;
+        FF(ufi_select_all(rank, &mask));
+        FF(ufi_iram_repair_config(rank, mask, config_array));
     }
 
-err:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+end:
     return status;
 }
 
 static dpu_error_t
-dpu_check_for_wram_repair(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id)
+dpu_wram_repair_config(struct dpu_rank_t *rank)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_planner_status_e planner_status;
-    dpu_query_t query;
+    LOG_RANK(VERBOSE, rank, "");
+    dpu_error_t status;
 
     if (rank->description->configuration.do_wram_repair) {
-        LOG_CI(VERBOSE, rank, slice_id, "WRAM repair enabled");
-        /* 1/ Fill the WRAM with "0", and read it back: if any bit is stuck at "1" => fix this problem. */
-        status = find_faulty_wram_bits_blocked_at(transaction, rank, slice_id, false);
-        if (status != DPU_OK)
-            goto err;
-
-        /* 2/ Fill the WRAM with "1", and read it back: if any bit is stuck at "0" => fix this problem. */
-        status = find_faulty_wram_bits_blocked_at(transaction, rank, slice_id, true);
-        if (status != DPU_OK)
-            goto err;
-
-        for (dpu_member_id_t dpu_id = 0; dpu_id < rank->description->topology.nr_of_dpus_per_control_interface; ++dpu_id) {
-            struct dpu_t *dpu = dpu_get(rank, slice_id, dpu_id);
-            status = try_to_repair_wram(transaction, dpu);
-            if (status != DPU_OK)
-                goto err;
-        }
+        LOG_RANK(VERBOSE, rank, "WRAM repair enabled");
+        // SRAM defects were filled at rank allocation
+        FF(try_to_repair_wram(rank));
     } else {
-        LOG_CI(VERBOSE, rank, slice_id, "WRAM repair disabled");
         // Default configuration
+        LOG_RANK(VERBOSE, rank, "WRAM repair disabled");
+        struct dpu_repair_config config = { 0, 0, 0, 0, 0, 0, 0, 1 };
+        struct dpu_repair_config *config_array[DPU_MAX_NR_CIS] = { [0 ... DPU_MAX_NR_CIS - 1] = &config };
+        uint8_t mask = ALL_CIS;
+        FF(ufi_select_all(rank, &mask));
         for (uint8_t each_wram_bank = 0; each_wram_bank < NR_OF_WRAM_BANKS; ++each_wram_bank) {
-            build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err);
-            safe_execute_transaction(transaction, rank, planner_status, status, err);
-            status = dpu_configure_wram_repair_for_previous(rank, slice_id, each_wram_bank, 0, 0, 0, 0, 0, 0, 0, 1);
-            if (status != DPU_OK)
-                goto err;
+            FF(ufi_wram_repair_config(rank, mask, each_wram_bank, config_array));
         }
     }
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-
-err:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+end:
     return status;
 }
 
 static dpu_error_t
-dpu_clear_debug_replace(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id)
+dpu_clear_debug(struct dpu_rank_t *rank)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
+    LOG_RANK(VERBOSE, rank, "");
+    dpu_error_t status;
 
-    for (dpu_member_id_t each_dpu = 0; each_dpu < rank->description->topology.nr_of_dpus_per_control_interface; ++each_dpu) {
-        safe_add_query(
-            query, dpu_query_build_debug_std_replace_clear_for_dpu(slice_id, each_dpu), transaction, status, err_query);
-    }
+    uint8_t mask = ALL_CIS;
+    FF(ufi_select_all(rank, &mask));
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
+    FF(ufi_clear_debug_replace(rank, mask));
+    FF(ufi_clear_fault_poison(rank, mask));
+    FF(ufi_clear_fault_bkp(rank, mask));
+    FF(ufi_clear_fault_dma(rank, mask));
+    FF(ufi_clear_fault_mem(rank, mask));
+    FF(ufi_clear_fault_dpu(rank, mask));
+    FF(ufi_clear_fault_intercept(rank, mask));
 
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
+end:
     return status;
 }
 
-static dpu_error_t
-dpu_clear_pc_mode(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id, dpu_pc_mode_e pc_mode)
+static const char *
+pc_mode_to_string(enum dpu_pc_mode pc_mode)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    dpu_pc_mode_e *pc_modes;
-
-    uint8_t nr_of_dpus_per_control_interface = rank->description->topology.nr_of_dpus_per_control_interface;
-    if ((pc_modes = malloc(nr_of_dpus_per_control_interface * sizeof(*pc_modes))) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
+    switch (pc_mode) {
+        case DPU_PC_MODE_12:
+            return "12";
+        case DPU_PC_MODE_13:
+            return "13";
+        case DPU_PC_MODE_14:
+            return "14";
+        case DPU_PC_MODE_15:
+            return "15";
+        case DPU_PC_MODE_16:
+            return "16";
+        default:
+            return "UNKNOWN";
     }
+}
 
-    build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err_query);
+static dpu_error_t
+dpu_set_pc_mode(struct dpu_rank_t *rank, enum dpu_pc_mode pc_mode)
+{
+    LOG_RANK(VERBOSE, rank, "%s", pc_mode_to_string(pc_mode));
+    dpu_error_t status;
+    enum dpu_pc_mode pc_modes[DPU_MAX_NR_CIS] = { [0 ... DPU_MAX_NR_CIS - 1] = pc_mode };
 
-    safe_add_query(query, dpu_query_build_write_pc_mode_for_previous(slice_id, pc_mode), transaction, status, err_query);
+    uint8_t mask = ALL_CIS;
+    FF(ufi_select_all(rank, &mask));
+    FF(ufi_set_pc_mode(rank, mask, pc_modes));
 
-    for (dpu_member_id_t dpu_id = 0; dpu_id < nr_of_dpus_per_control_interface; ++dpu_id) {
-        if (dpu_get(rank, slice_id, dpu_id)->enabled) {
-            safe_add_query(
-                query, dpu_query_build_read_pc_mode_for_dpu(slice_id, dpu_id, pc_modes + dpu_id), transaction, status, err_query);
-        }
-    }
+    uint8_t nr_cis = rank->description->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus_per_ci = rank->description->topology.nr_of_dpus_per_control_interface;
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
+    for (dpu_member_id_t dpu_id = 0; dpu_id < nr_dpus_per_ci; ++dpu_id) {
+        mask = ALL_CIS;
+        FF(ufi_select_dpu(rank, &mask, dpu_id));
+        FF(ufi_get_pc_mode(rank, mask, pc_modes));
 
-    for (dpu_member_id_t dpu_id = 0; dpu_id < nr_of_dpus_per_control_interface; ++dpu_id) {
-        struct dpu_t *dpu = dpu_get(rank, slice_id, dpu_id);
-        if (dpu->enabled) {
-            if (pc_modes[dpu_id] != pc_mode) {
-                LOG_DPU(WARNING, dpu, "ERROR: invalid PC mode (expected: %d, found: %d)", pc_mode, pc_modes[dpu_id]);
-                status = DPU_ERR_INTERNAL;
-                break;
+        for (dpu_slice_id_t slice_id = 0; slice_id < nr_cis; ++slice_id) {
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, slice_id, dpu_id);
+            if (dpu->enabled) {
+                if (pc_modes[dpu_id] != pc_mode) {
+                    LOG_DPU(WARNING, dpu, "ERROR: invalid PC mode (expected: %d, found: %d)", pc_mode, pc_modes[dpu_id]);
+                    status = DPU_ERR_INTERNAL;
+                    break;
+                }
             }
         }
     }
 
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-    free(pc_modes);
 end:
     return status;
 }
 
 static dpu_error_t
-dpu_clear_faults_for_rank(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id)
+dpu_clear_run_bits(struct dpu_rank_t *rank)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t ignored;
+    LOG_RANK(VERBOSE, rank, "");
 
-    /* 0/ Selection */
-    build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err_query);
+    dpu_error_t status;
 
-    /* 1/ POISON fault */
-    safe_add_query(query, dpu_query_build_clear_poison_fault_for_previous(slice_id), transaction, status, err_query);
-    /* 2/ BKP fault */
-    safe_add_query(query, dpu_query_build_clear_bkp_fault_for_previous(slice_id), transaction, status, err_query);
-    /* 3/ MEM fault */
-    safe_add_query(
-        query, dpu_query_build_read_and_clear_mem_fault_for_previous(slice_id, &ignored), transaction, status, err_query);
-    /* 4/ DMA fault */
-    safe_add_query(
-        query, dpu_query_build_read_and_clear_dma_fault_for_previous(slice_id, &ignored), transaction, status, err_query);
-    /* 5/ General fault */
-    safe_add_query(query, dpu_query_build_clear_dpu_fault_state_for_previous(slice_id), transaction, status, err_query);
-    /* 5-bis/ Interception Fault */
-    safe_add_query(query, dpu_query_build_read_bkp_fault_for_previous(slice_id, &ignored), transaction, status, err_query);
+    uint8_t mask = ALL_CIS;
+    FF(ufi_select_all(rank, &mask));
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
+    uint32_t nr_run_bits = rank->description->dpu.nr_of_threads + rank->description->dpu.nr_of_notify_bits;
 
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    return status;
-}
-
-static dpu_error_t
-dpu_clear_faults_for_dpu(dpu_transaction_t transaction, struct dpu_t *dpu)
-{
-    LOG_DPU(VERBOSE, dpu, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t ignored;
-
-    struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t dpu_id = dpu->dpu_id;
-
-    /* 1/ BKP fault */
-    safe_add_query(query, dpu_query_build_clear_bkp_fault_for_dpu(slice_id, dpu_id), transaction, status, err_query);
-    /* 2/ MEM fault */
-    safe_add_query(
-        query, dpu_query_build_read_and_clear_mem_fault_for_dpu(slice_id, dpu_id, &ignored), transaction, status, err_query);
-    /* 3/ DMA fault */
-    safe_add_query(
-        query, dpu_query_build_read_and_clear_dma_fault_for_dpu(slice_id, dpu_id, &ignored), transaction, status, err_query);
-    /* 4/ POISON fault */
-    safe_add_query(query, dpu_query_build_clear_poison_fault_for_dpu(slice_id, dpu_id), transaction, status, err_query);
-    /* 5/ General fault */
-    safe_add_query(query, dpu_query_build_clear_dpu_fault_state_for_dpu(slice_id, dpu_id), transaction, status, err_query);
-    /* 5-bis/ Interception Fault */
-    safe_add_query(query, dpu_query_build_read_bkp_fault_for_dpu(slice_id, dpu_id, &ignored), transaction, status, err_query);
-
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    return status;
-}
-
-static dpu_error_t
-dpu_clear_thread_run_reg_for_rank(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id)
-{
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t ignored;
-
-    build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err_query);
-
-    for (dpu_thread_t each_thread = 0; each_thread < rank->description->dpu.nr_of_threads; ++each_thread) {
-        safe_add_query(query,
-            dpu_query_build_clear_run_thread_for_previous(slice_id, each_thread, &ignored),
-            transaction,
-            status,
-            err_query);
+    for (uint32_t each_bit = 0; each_bit < nr_run_bits; ++each_bit) {
+        FF(ufi_clear_run_bit(rank, mask, each_bit, NULL));
     }
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
+end:
     return status;
 }
 
-static dpu_error_t
-dpu_clear_notify_bit_reg_for_rank(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id)
+static inline const char *
+stack_direction_to_string(bool stack_is_up)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t ignored;
-    uint8_t offset = rank->description->dpu.nr_of_threads;
+    return stack_is_up ? "up" : "down";
+}
 
-    build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err_query);
+static dpu_error_t
+dpu_set_stack_direction(struct dpu_rank_t *rank, bool stack_is_up)
+{
+    LOG_RANK(VERBOSE, rank, "%s", stack_direction_to_string(stack_is_up));
+    dpu_error_t status;
+    uint8_t previous_directions[DPU_MAX_NR_CIS];
+    bool stack_directions[DPU_MAX_NR_CIS] = { [0 ... DPU_MAX_NR_CIS - 1] = stack_is_up };
 
-    for (dpu_notify_bit_id_t each_notify_bit = 0; each_notify_bit < rank->description->dpu.nr_of_notify_bits; ++each_notify_bit) {
-        dpu_notify_bit_id_t real_notify_bit = offset + each_notify_bit;
-        safe_add_query(query,
-            dpu_query_build_read_and_clear_notify_bit_for_previous(slice_id, real_notify_bit, &ignored),
-            transaction,
-            status,
-            err_query);
+    uint8_t mask = ALL_CIS;
+    FF(ufi_select_all(rank, &mask));
+    FF(ufi_set_stack_direction(rank, mask, stack_directions, NULL));
+    FF(ufi_set_stack_direction(rank, mask, stack_directions, previous_directions));
+
+    uint8_t nr_cis = rank->description->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus_per_ci = rank->description->topology.nr_of_dpus_per_control_interface;
+
+    for (dpu_slice_id_t slice_id = 0; slice_id < nr_cis; ++slice_id) {
+        for (dpu_member_id_t dpu_id = 0; dpu_id < nr_dpus_per_ci; ++dpu_id) {
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, slice_id, dpu_id);
+            if (dpu->enabled) {
+                bool stack_if_effectively_up = dpu_mask_is_selected(previous_directions[slice_id], dpu_id);
+                if (stack_if_effectively_up != stack_is_up) {
+                    LOG_DPU(WARNING,
+                        dpu,
+                        "ERROR: invalid stack mode (expected: %s, found: %s)",
+                        stack_direction_to_string(stack_is_up),
+                        stack_direction_to_string(stack_if_effectively_up));
+                    status = DPU_ERR_INTERNAL;
+                }
+            }
+        }
     }
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
+end:
     return status;
 }
 
 static dpu_error_t
-dpu_clear_notify_bit_reg_for_dpu(dpu_transaction_t transaction, struct dpu_t *dpu)
+dpu_reset_internal_state(struct dpu_rank_t *rank)
 {
-    LOG_DPU(VERBOSE, dpu, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t ignored;
-
-    struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t dpu_id = dpu->dpu_id;
-    uint8_t offset = rank->description->dpu.nr_of_threads;
-
-    for (dpu_notify_bit_id_t each_notify_bit = 0; each_notify_bit < rank->description->dpu.nr_of_notify_bits; ++each_notify_bit) {
-        dpu_notify_bit_id_t real_notify_bit = offset + each_notify_bit;
-        safe_add_query(query,
-            dpu_query_build_read_and_clear_notify_bit_for_dpu(slice_id, dpu_id, real_notify_bit, &ignored),
-            transaction,
-            status,
-            err_query);
-    }
-
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    return status;
-}
-
-static dpu_error_t
-dpu_set_stack_up(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id)
-{
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t ignored, previous_stack_up;
-    dpu_selected_mask_t mask_all = rank->runtime.control_interface.slice_info[slice_id].enabled_dpus;
-
-    build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err_query);
-
-    safe_add_query(query, dpu_query_build_read_and_set_stack_up_for_previous(slice_id, &ignored), transaction, status, err_query);
-    safe_add_query(
-        query, dpu_query_build_read_and_set_stack_up_for_previous(slice_id, &previous_stack_up), transaction, status, err_query);
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-
-    if (previous_stack_up != mask_all) {
-        LOG_CI(
-            WARNING, rank, slice_id, "ERROR: invalid stack mode (expected: 0x%08x, found: 0x%08x)", mask_all, previous_stack_up);
-        status = DPU_ERR_INTERNAL;
-        goto err_query;
-    }
-
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    return status;
-}
-
-static dpu_error_t
-dpu_reset_internal_state(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id)
-{
-    LOG_CI(VERBOSE, rank, slice_id, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t ignored;
-    uint32_t result;
+    LOG_RANK(VERBOSE, rank, "");
+    dpu_error_t status;
     iram_size_t internal_state_reset_size;
+    uint8_t nr_cis = rank->description->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus = rank->description->topology.nr_of_dpus_per_control_interface;
+    uint8_t nr_threads = rank->description->dpu.nr_of_threads;
     dpuinstruction_t *internal_state_reset = fetch_internal_reset_program(&internal_state_reset_size);
 
     if (internal_state_reset == NULL) {
@@ -1729,208 +1301,181 @@ dpu_reset_internal_state(dpu_transaction_t transaction, struct dpu_rank_t *rank,
         goto end;
     }
 
-    dpu_selected_mask_t mask_all = rank->runtime.control_interface.slice_info[slice_id].enabled_dpus;
+    dpuinstruction_t *iram_array[DPU_MAX_NR_CIS] = { [0 ... DPU_MAX_NR_CIS - 1] = internal_state_reset };
 
-    build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err_query);
+    uint8_t mask = ALL_CIS;
+    FF(ufi_select_all(rank, &mask));
+    FF(ufi_iram_write(rank, mask, iram_array, 0, internal_state_reset_size));
 
-    safe_add_query(query,
-        dpu_query_build_write_iram_instruction_for_previous(
-            slice_id, mask_all, 0, (dpuinstruction_t *)internal_state_reset, internal_state_reset_size),
-        transaction,
-        status,
-        err_query);
-
-    for (dpu_thread_t each_thread = 0; each_thread < rank->description->dpu.nr_of_threads; ++each_thread) {
-        safe_add_query(
-            query, dpu_query_build_boot_thread_for_previous(slice_id, each_thread, &ignored), transaction, status, err_query);
+    for (dpu_thread_t each_thread = 0; each_thread < nr_threads; ++each_thread) {
+        FF(ufi_thread_boot(rank, mask, each_thread, NULL));
     }
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    safe_add_query(query, dpu_query_build_read_dpu_run_state_for_previous(slice_id, &result), transaction, status, err_query);
-
+    uint8_t mask_all = (1 << nr_dpus) - 1;
+    uint8_t state[DPU_MAX_NR_CIS];
+    bool running;
     do {
-        safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-    } while ((result & mask_all) != 0);
+        FF(ufi_read_dpu_run(rank, mask, state));
 
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-    free(internal_state_reset);
+        running = false;
+        for (dpu_slice_id_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
+            if (!CI_MASK_ON(mask, each_ci))
+                continue;
+            running = running || ((state[each_ci] & mask_all) != 0);
+        }
+    } while (running);
+
 end:
+    free(internal_state_reset);
     return status;
 }
 
 static dpu_error_t
-dpu_reset_internal_state_for_dpu(dpu_transaction_t transaction, struct dpu_t *dpu)
+dpu_init_mram_mux(struct dpu_rank_t *rank)
 {
-    LOG_DPU(VERBOSE, dpu, "");
-    dpu_error_t status = DPU_OK;
-    dpu_query_t query;
-    dpu_planner_status_e planner_status;
-    uint32_t ignored;
-    uint32_t result;
+    LOG_RANK(VERBOSE, rank, "");
+    dpu_error_t status;
 
-    struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t member_id = dpu->dpu_id;
-
-    iram_size_t internal_state_reset_size;
-    dpuinstruction_t *internal_state_reset = fetch_internal_reset_program(&internal_state_reset_size);
-
-    if (internal_state_reset == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
+    if (!rank->description->configuration.api_must_switch_mram_mux && !rank->description->configuration.init_mram_mux) {
+        return DPU_OK;
     }
 
-    dpu_selected_mask_t mask_one = dpu_mask_one(member_id);
-    safe_add_query(query,
-        dpu_query_build_write_iram_instruction_for_dpu(
-            slice_id, member_id, mask_one, 0, (dpuinstruction_t *)internal_state_reset, internal_state_reset_size),
-        transaction,
-        status,
-        err_query);
+    uint8_t mask = ALL_CIS;
+    FF(ufi_select_all(rank, &mask));
+    FF(ufi_set_mram_mux(rank, mask, true));
 
-    for (dpu_thread_t each_thread = 0; each_thread < rank->description->dpu.nr_of_threads; ++each_thread) {
-        safe_add_query(query,
-            dpu_query_build_boot_thread_for_dpu(slice_id, member_id, each_thread, &ignored),
-            transaction,
-            status,
-            err_query);
+    for (dpu_slice_id_t each_ci = 0; each_ci < rank->description->topology.nr_of_control_interfaces; ++each_ci) {
+        if (!CI_MASK_ON(mask, each_ci))
+            continue;
+
+        for (dpu_member_id_t each_dpu = 0; each_dpu < rank->description->topology.nr_of_dpus_per_control_interface; ++each_dpu) {
+            FF(dpu_check_wavegen_mux_status_for_dpu(DPU_GET_UNSAFE(rank, each_ci, each_dpu), WAVEGEN_MUX_DPU_EXPECTED));
+        }
     }
 
-    safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    safe_add_query(
-        query, dpu_query_build_read_dpu_run_state_for_dpu(slice_id, member_id, &result), transaction, status, err_query);
-
-    do {
-        safe_execute_transaction(transaction, rank, planner_status, status, err_query);
-    } while ((result & mask_one) != 0);
-
-err_query:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-    free(internal_state_reset);
 end:
     return status;
 }
 
 static dpu_error_t
-dpu_check_wavegen_mux_status_for_dpu(dpu_transaction_t transaction, struct dpu_t *dpu, uint8_t expected)
+dpu_check_wavegen_mux_status_for_dpu(struct dpu_t *dpu, uint8_t expected)
 {
     LOG_DPU(VERBOSE, dpu, "");
     dpu_error_t status;
-    dpu_dma_ctrl_t dpu_dma_ctrl = 0;
+    uint8_t dpu_dma_ctrl = 0;
 
-    status = wavegen_mux_status(transaction, dpu, expected, 0x02, &dpu_dma_ctrl);
-    if (status != DPU_OK)
-        goto err;
+    FF(wavegen_mux_status_for_dpu(dpu, expected, 0x02, &dpu_dma_ctrl));
 
-    if (dpu_dma_ctrl & 0x80) {
+    if (dpu_dma_ctrl & MUX_COLLISION_ERR) {
         LOG_DPU(WARNING, dpu, "MRAM collision detected, either host or DPU wrote in the MRAM without permission. Clearing it...");
-        status = wavegen_mux_status(transaction, dpu, expected, 0x82, &dpu_dma_ctrl);
-        if (status != DPU_OK)
-            goto err;
+        FF(wavegen_mux_status_for_dpu(dpu, expected, 0x82, &dpu_dma_ctrl));
     }
 
-err:
+end:
     return status;
 }
 
 static dpu_error_t
-host_release_access(dpu_transaction_t transaction, struct dpu_t *dpu)
+host_handle_access_for_dpu(struct dpu_t *dpu, bool set_mux_for_dpu)
 {
-#define WAVEGEN_MUX_DPU_EXPECTED 0x03
     dpu_error_t status;
-    dpu_planner_status_e planner_status;
-    dpu_query_t query;
 
     struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t dpu_id = dpu->dpu_id;
+    uint8_t ci_mask = CI_MASK_ONE(dpu->slice_id);
 
-    safe_add_query(query, dpu_query_build_select_dpu_for_control(slice_id, dpu_id), transaction, status, err);
+    FF(ufi_select_dpu_even_disabled(rank, &ci_mask, dpu->dpu_id));
+    FF(ufi_set_mram_mux(rank, ci_mask, set_mux_for_dpu));
 
-    DMA_CTRL_WRITE(slice_id, 0x80, 0x01); // dpu_bank_ctrl
-    DMA_CTRL_WRITE(slice_id, 0x81, 0x00); // dpu_wrmask_ctrl
-    DMA_CTRL_WRITE(slice_id, 0x82, 0x01); // dpu_wr_ctrl
-    DMA_CTRL_WRITE(slice_id, 0x84, 0x01); // dpu_wr_en_ctrl
+    FF(dpu_check_wavegen_mux_status_for_dpu(dpu, set_mux_for_dpu ? WAVEGEN_MUX_DPU_EXPECTED : WAVEGEN_MUX_HOST_EXPECTED));
 
-    /* Clear WaveForm Generator Configuration Path and flush reg_replace_instr of readop2 */
-    safe_add_query(query, dpu_query_build_clear_dma_control_for_previous(slice_id), transaction, status, err);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    status = dpu_check_wavegen_mux_status_for_dpu(transaction, dpu, WAVEGEN_MUX_DPU_EXPECTED);
-    if (status != DPU_OK)
-        goto err;
-
-err:
+end:
     return status;
 }
 
 static dpu_error_t
-host_get_access(dpu_transaction_t transaction, struct dpu_t *dpu)
+host_release_access_for_dpu(struct dpu_t *dpu)
 {
-#define WAVEGEN_MUX_HOST_EXPECTED 0x00
+    return host_handle_access_for_dpu(dpu, true);
+}
+
+static dpu_error_t
+host_get_access_for_dpu(struct dpu_t *dpu)
+{
+    return host_handle_access_for_dpu(dpu, false);
+}
+
+static dpu_error_t
+dpu_check_wavegen_mux_status_for_rank(struct dpu_rank_t *rank, uint8_t expected)
+{
+    LOG_RANK(VERBOSE, rank, "");
     dpu_error_t status;
-    dpu_planner_status_e planner_status;
-    dpu_query_t query;
+    dpu_member_id_t mask_collision = 0;
 
-    struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t dpu_id = dpu->dpu_id;
+    FF(wavegen_mux_status_for_rank(rank, expected, 0x02, &mask_collision, 0));
 
-    safe_add_query(query, dpu_query_build_select_dpu_for_control(slice_id, dpu_id), transaction, status, err);
-    DMA_CTRL_WRITE(slice_id, 0x80, 0x00); // dpu_bank_ctrl
-    DMA_CTRL_WRITE(slice_id, 0x81, 0x00); // dpu_wrmask_ctrl
-    DMA_CTRL_WRITE(slice_id, 0x82, 0x00); // dpu_wr_ctrl
-    DMA_CTRL_WRITE(slice_id, 0x84, 0x00); // dpu_wr_en_ctrl
+    if (mask_collision) {
+        LOG_RANK(
+            WARNING, rank, "MRAM collision detected, either host or DPU wrote in the MRAM without permission. Clearing it...");
+        FF(wavegen_mux_status_for_rank(rank, expected, 0x82, NULL, mask_collision));
+    }
 
-    /* Clear WaveForm Generator Configuration Path and flush reg_replace_instr of readop2 */
-    safe_add_query(query, dpu_query_build_clear_dma_control_for_previous(slice_id), transaction, status, err);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-
-    status = dpu_check_wavegen_mux_status_for_dpu(transaction, dpu, WAVEGEN_MUX_HOST_EXPECTED);
-    if (status != DPU_OK)
-        goto err;
-
-err:
+end:
     return status;
 }
 
 static dpu_error_t
-wavegen_mux_status(dpu_transaction_t transaction,
-    struct dpu_t *dpu,
-    uint8_t expected,
-    uint8_t cmd,
-    dpu_dma_ctrl_t *ret_dpu_dma_ctrl)
+host_handle_access_for_rank(struct dpu_rank_t *rank, bool set_mux_for_dpu)
 {
+    dpu_error_t status;
+
+    uint8_t mask = ALL_CIS;
+
+    FF(ufi_select_all(rank, &mask));
+    FF(ufi_set_mram_mux(rank, mask, set_mux_for_dpu));
+
+    FF(dpu_check_wavegen_mux_status_for_rank(rank, set_mux_for_dpu ? WAVEGEN_MUX_DPU_EXPECTED : WAVEGEN_MUX_HOST_EXPECTED));
+
+end:
+    return status;
+}
+
+static dpu_error_t
+host_release_access_for_rank(struct dpu_rank_t *rank)
+{
+    return host_handle_access_for_rank(rank, true);
+}
+
+static dpu_error_t
+host_get_access_for_rank(struct dpu_rank_t *rank)
+{
+    return host_handle_access_for_rank(rank, false);
+}
+
 #define TIMEOUT_MUX_STATUS (10000)
-    dpu_error_t status = DPU_OK;
-    dpu_planner_status_e planner_status;
-    dpu_dma_ctrl_t dpu_dma_ctrl = 0;
+
+static dpu_error_t
+wavegen_mux_status_for_dpu(struct dpu_t *dpu, uint8_t expected, uint8_t cmd, uint8_t *ret_dpu_dma_ctrl)
+{
+    dpu_error_t status;
+    uint8_t dpu_dma_ctrl;
+    uint8_t result_array[DPU_MAX_NR_CIS];
     uint32_t timeout = TIMEOUT_MUX_STATUS;
-    dpu_query_t query;
 
     struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
+    uint8_t ci_mask = CI_MASK_ONE(dpu->slice_id);
+
+    FF(ufi_select_dpu_even_disabled(rank, &ci_mask, dpu->dpu_id));
 
     // Check Mux control through dma_rdat_ctrl of fetch1
     // 1 - Select WaveGen Read register @0xFF and set it @0x02  (mux and collision ctrl)
     // 2 - Flush readop2 (Pipeline to DMA cfg data path)
     // 3 - Read dpu_dma_ctrl
-    DMA_CTRL_WRITE(slice_id, 0xFF, cmd); // Select read register Mux ctrl
-    // Clear WaveForm Generator Configuration Path and flush reg_replace_instr of readop2
-    safe_add_query(query, dpu_query_build_clear_dma_control_for_previous(slice_id), transaction, status, err);
+    FF(ufi_write_dma_ctrl(rank, ci_mask, 0xFF, cmd));
+    FF(ufi_clear_dma_ctrl(rank, ci_mask));
 
     do {
-        safe_add_query(query, dpu_query_build_read_dma_control_for_previous(slice_id, &dpu_dma_ctrl), transaction, status, err);
-        safe_execute_transaction(transaction, rank, planner_status, status, err);
-        dpu_transaction_free_queries_for_slice(transaction, slice_id);
+        FF(ufi_read_dma_ctrl(rank, ci_mask, result_array));
+        dpu_dma_ctrl = result_array[dpu->slice_id];
         // Expected 0x3 for DPU4 since it is the only one to be refreshed
         // Expected 0x0 for others DPU since no refresh has been issued
         LOG_DPU(VERBOSE, dpu, "XMA Init = 0x%02x (expected = 0x%02x)", dpu_dma_ctrl, expected);
@@ -1944,133 +1489,80 @@ wavegen_mux_status(dpu_transaction_t transaction,
 
     *ret_dpu_dma_ctrl = dpu_dma_ctrl;
 
-err:
+end:
     return status;
 }
 
-static void
-check_if_memory_address_is_faulty_and_update_context(struct dpu_memory_repair_t *repair_info,
-    uint32_t address,
-    uint64_t expected,
-    uint64_t found)
-{
-    uint64_t faulty_bits = expected ^ found;
-
-    if (faulty_bits != 0) {
-        uint32_t previous_nr_of_corrupted_addr = repair_info->nr_of_corrupted_addresses++;
-        uint32_t index = previous_nr_of_corrupted_addr;
-        uint32_t current_max_index
-            = (previous_nr_of_corrupted_addr > NB_MAX_REPAIR_ADDR) ? NB_MAX_REPAIR_ADDR : previous_nr_of_corrupted_addr;
-
-        for (uint32_t each_known_corrupted_addr_idx = 0; each_known_corrupted_addr_idx < current_max_index;
-             ++each_known_corrupted_addr_idx) {
-            if (repair_info->corrupted_addresses[previous_nr_of_corrupted_addr].address == address) {
-                index = each_known_corrupted_addr_idx;
-                repair_info->nr_of_corrupted_addresses--;
-                break;
-            }
-        }
-
-        if (index < NB_MAX_REPAIR_ADDR) {
-            repair_info->corrupted_addresses[index].address = address;
-
-            if (expected == 0) {
-                repair_info->corrupted_addresses[index].bits_set_to_one = faulty_bits;
-            } else {
-                repair_info->corrupted_addresses[index].bits_set_to_zero = faulty_bits;
-            }
-        }
-    }
-}
-
 static dpu_error_t
-find_faulty_iram_bits_blocked_at(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id, bool bit_is_set)
+wavegen_mux_status_for_rank(struct dpu_rank_t *rank,
+    uint8_t expected,
+    uint8_t cmd,
+    dpu_member_id_t *mask_collision,
+    dpu_member_id_t mask_dpu)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
     dpu_error_t status;
-    dpu_planner_status_e planner_status;
-    dpu_query_t query;
-    dpuinstruction_t *iram_content;
+    uint8_t dpu_dma_ctrl;
+    uint8_t result_array[DPU_MAX_NR_CIS];
+    uint32_t timeout;
+    uint8_t ci_mask = ALL_CIS, mask;
+    uint8_t nr_dpus = rank->description->topology.nr_of_dpus_per_control_interface;
+    uint8_t nr_cis = rank->description->topology.nr_of_control_interfaces;
+    bool should_retry;
 
-    dpuinstruction_t instruction_value = bit_is_set ? 0x0000FFFFFFFFFFFFL : 0x0000000000000000L;
-    uint8_t byte_value = (uint8_t)instruction_value;
-    uint8_t nb_of_dpus = rank->description->topology.nr_of_dpus_per_control_interface;
-    iram_size_t iram_size = rank->description->memories.iram_size;
-    dpu_selected_mask_t mask_all = rank->runtime.control_interface.slice_info[slice_id].enabled_dpus;
+    /* ci_mask retains the real disabled CIs, whereas mask does not take
+     * care of disabled dpus (and then CIs) since it should switch mux of
+     * disabled dpus: but not in the case a CI is completely deactivated.
+     */
 
-    iram_content = malloc(iram_size * sizeof(*iram_content));
-    if (iram_content == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
-    }
+    // Check Mux control through dma_rdat_ctrl of fetch1
+    // 1 - Select WaveGen Read register @0xFF and set it @0x02  (mux and collision ctrl)
+    // 2 - Flush readop2 (Pipeline to DMA cfg data path)
+    // 3 - Read dpu_dma_ctrl
+    ci_mask = ALL_CIS;
+    FF(ufi_select_all(rank, &ci_mask));
+    FF(ufi_write_dma_ctrl(rank, ci_mask, 0xFF, cmd));
+    FF(ufi_clear_dma_ctrl(rank, ci_mask));
 
-    memset(iram_content, byte_value, iram_size * sizeof(*iram_content));
+    for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus; ++each_dpu) {
+        dpu_selected_mask_t mask_one = dpu_mask_one(each_dpu);
 
-    // Configuration to repair something else than address 0
-    build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-    status = dpu_configure_iram_repair_for_previous(rank, slice_id, 0, 1, 1, 0, 1, 1, 0, 1);
-    if (status != DPU_OK)
-        goto err;
+        if (mask_dpu && !(mask_dpu & mask_one))
+            continue;
 
-    // Write + Read address 0
-    safe_add_query(query,
-        dpu_query_build_write_iram_instruction_for_previous(slice_id, mask_all, 0, iram_content, 1),
-        transaction,
-        status,
-        err);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
+        timeout = TIMEOUT_MUX_STATUS;
 
-    for (dpu_member_id_t each_dpu = 0; each_dpu < nb_of_dpus; ++each_dpu) {
-        safe_add_query(query, dpu_query_build_select_dpu_for_control(slice_id, each_dpu), transaction, status, err);
-        safe_add_query(
-            query, dpu_query_build_read_iram_instruction_for_previous(slice_id, 0, 1, iram_content), transaction, status, err);
-        safe_execute_transaction(transaction, rank, planner_status, status, err);
-        dpu_transaction_free_queries_for_slice(transaction, slice_id);
+        do {
+            should_retry = false;
 
-        struct dpu_t *dpu = dpu_get(rank, slice_id, each_dpu);
-        check_if_memory_address_is_faulty_and_update_context(&dpu->repair.iram_repair, 0, instruction_value, iram_content[0]);
-    }
+            mask = ALL_CIS;
+            FF(ufi_select_dpu_even_disabled(rank, &mask, each_dpu));
+            FF(ufi_read_dma_ctrl(rank, mask, result_array));
 
-    // Configuration to repair address 0
-    build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-    status = dpu_configure_iram_repair_for_previous(rank, slice_id, 0, 0, 0, 0, 0, 0, 0, 1);
-    if (status != DPU_OK)
-        goto err;
+            for (dpu_slice_id_t each_slice = 0; each_slice < nr_cis; ++each_slice) {
+                if (!CI_MASK_ON(ci_mask, each_slice))
+                    continue;
 
-    // Write + Read the rest of the IRAM
-    safe_add_query(query,
-        dpu_query_build_write_iram_instruction_for_previous(
-            slice_id, mask_all, 1, iram_content + 1, (iram_size_t)(iram_size - 1)),
-        transaction,
-        status,
-        err);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
+                dpu_dma_ctrl = result_array[each_slice];
 
-    for (dpu_member_id_t each_dpu = 0; each_dpu < nb_of_dpus; ++each_dpu) {
-        safe_add_query(query, dpu_query_build_select_dpu_for_control(slice_id, each_dpu), transaction, status, err);
-        safe_add_query(query,
-            dpu_query_build_read_iram_instruction_for_previous(slice_id, 1, (iram_size_t)(iram_size - 1), iram_content + 1),
-            transaction,
-            status,
-            err);
-        safe_execute_transaction(transaction, rank, planner_status, status, err);
-        dpu_transaction_free_queries_for_slice(transaction, slice_id);
+                if ((dpu_dma_ctrl & 0x7F) != expected)
+                    should_retry = true;
 
-        struct dpu_t *dpu = dpu_get(rank, slice_id, each_dpu);
-        for (iram_addr_t each_address = 1; each_address < iram_size; ++each_address) {
-            check_if_memory_address_is_faulty_and_update_context(
-                &dpu->repair.iram_repair, each_address, instruction_value, iram_content[each_address]);
+                /* In case of collision, only save the dpu, not the CI, since
+                 * we have to write to all CIs at once anyway.
+                 */
+                if (mask_collision && (dpu_dma_ctrl & MUX_COLLISION_ERR))
+                    *mask_collision = *mask_collision | mask_one;
+            }
+
+            timeout--;
+        } while (timeout && should_retry); // Do not check Collision Error bit
+
+        if (!timeout) {
+            LOG_RANK(WARNING, rank, "Timeout waiting for result to be correct");
+            return rank->description->configuration.disable_api_safe_checks ? DPU_OK : DPU_ERR_TIMEOUT;
         }
     }
 
-err:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-    free(iram_content);
 end:
     return status;
 }
@@ -2096,23 +1588,16 @@ find_index_of_last_faulty_bit(uint64_t data)
 static bool
 extract_memory_repair_configuration(struct dpu_t *dpu,
     struct dpu_memory_repair_t *repair_info,
-    uint8_t *AB_msbs,
-    uint8_t *A_lsbs,
-    uint8_t *B_lsbs,
-    uint8_t *CD_msbs,
-    uint8_t *C_lsbs,
-    uint8_t *D_lsbs,
-    uint8_t *even_index,
-    uint8_t *odd_index)
+    struct dpu_repair_config *repair_config)
 {
-    *AB_msbs = 0xFF;
-    *CD_msbs = 0xFF;
-    *A_lsbs = 0xFF;
-    *B_lsbs = 0xFF;
-    *C_lsbs = 0xFF;
-    *D_lsbs = 0xFF;
-    *even_index = 0xFF;
-    *odd_index = 0xFF;
+    repair_config->AB_msbs = 0xFF;
+    repair_config->CD_msbs = 0xFF;
+    repair_config->A_lsbs = 0xFF;
+    repair_config->B_lsbs = 0xFF;
+    repair_config->C_lsbs = 0xFF;
+    repair_config->D_lsbs = 0xFF;
+    repair_config->even_index = 0xFF;
+    repair_config->odd_index = 0xFF;
 
     uint32_t nr_of_corrupted_addr = repair_info->nr_of_corrupted_addresses;
 
@@ -2121,11 +1606,10 @@ extract_memory_repair_configuration(struct dpu_t *dpu,
     for (uint32_t each_corrupted_addr_index = 0; each_corrupted_addr_index < nr_of_corrupted_addr; ++each_corrupted_addr_index) {
         LOG_DPU(DEBUG,
             dpu,
-            "repair info: #%d address: 0x%04x bits_set_to_zero: 0x%016lx bits_set_to_one: 0x%016lx",
+            "repair info: #%d address: 0x%04x faulty_bits: 0x%016lx",
             each_corrupted_addr_index,
             repair_info->corrupted_addresses[each_corrupted_addr_index].address,
-            repair_info->corrupted_addresses[each_corrupted_addr_index].bits_set_to_zero,
-            repair_info->corrupted_addresses[each_corrupted_addr_index].bits_set_to_one);
+            repair_info->corrupted_addresses[each_corrupted_addr_index].faulty_bits);
     }
 
     if (nr_of_corrupted_addr > NB_MAX_REPAIR_ADDR) {
@@ -2138,16 +1622,16 @@ extract_memory_repair_configuration(struct dpu_t *dpu,
         uint8_t msbs = (uint8_t)(address >> 4);
         uint8_t lsbs = (uint8_t)(address & 0xF);
 
-        if (*A_lsbs == 0xFF) {
-            *AB_msbs = msbs;
-            *A_lsbs = lsbs;
-        } else if ((*B_lsbs == 0xFF) && (*AB_msbs == msbs)) {
-            *B_lsbs = lsbs;
-        } else if (*C_lsbs == 0xFF) {
-            *CD_msbs = msbs;
-            *C_lsbs = lsbs;
-        } else if ((*D_lsbs == 0xFF) && (*CD_msbs == msbs)) {
-            *D_lsbs = lsbs;
+        if (repair_config->A_lsbs == 0xFF) {
+            repair_config->AB_msbs = msbs;
+            repair_config->A_lsbs = lsbs;
+        } else if ((repair_config->B_lsbs == 0xFF) && (repair_config->AB_msbs == msbs)) {
+            repair_config->B_lsbs = lsbs;
+        } else if (repair_config->C_lsbs == 0xFF) {
+            repair_config->CD_msbs = msbs;
+            repair_config->C_lsbs = lsbs;
+        } else if ((repair_config->D_lsbs == 0xFF) && (repair_config->CD_msbs == msbs)) {
+            repair_config->D_lsbs = lsbs;
         } else {
             LOG_DPU(WARNING, dpu, "ERROR: corrupted addresses are too far apart");
             return false;
@@ -2156,9 +1640,8 @@ extract_memory_repair_configuration(struct dpu_t *dpu,
 
     dpuinstruction_t faulty_bits = 0L;
 
-    for (uint8_t each_faulty_address = 0; each_faulty_address < nr_of_corrupted_addr; ++each_faulty_address) {
-        faulty_bits |= repair_info->corrupted_addresses[each_faulty_address].bits_set_to_zero;
-        faulty_bits |= repair_info->corrupted_addresses[each_faulty_address].bits_set_to_one;
+    for (uint32_t each_faulty_address = 0; each_faulty_address < nr_of_corrupted_addr; ++each_faulty_address) {
+        faulty_bits |= repair_info->corrupted_addresses[each_faulty_address].faulty_bits;
     }
 
     uint8_t nr_of_faulty_bits = count_nr_of_faulty_bits(faulty_bits);
@@ -2178,28 +1661,28 @@ extract_memory_repair_configuration(struct dpu_t *dpu,
             last_index = find_index_of_last_faulty_bit(faulty_bits);
 
             if ((last_index & 1) == 1) {
-                *odd_index = last_index;
+                repair_config->odd_index = last_index;
             } else {
-                *even_index = last_index;
+                repair_config->even_index = last_index;
             }
             // FALLTHROUGH
         case 1:
             first_index = find_index_of_first_faulty_bit(faulty_bits);
 
             if ((first_index & 1) == 1) {
-                if (*odd_index != 0xFF) {
+                if (repair_config->odd_index != 0xFF) {
                     LOG_DPU(WARNING, dpu, "ERROR: both corrupted bit indices are odd");
                     return false;
                 }
 
-                *odd_index = first_index;
+                repair_config->odd_index = first_index;
             } else {
-                if (*even_index != 0xFF) {
+                if (repair_config->even_index != 0xFF) {
                     LOG_DPU(WARNING, dpu, "ERROR: both corrupted bit indices are even");
                     return false;
                 }
 
-                *even_index = first_index;
+                repair_config->even_index = first_index;
             }
             // FALLTHROUGH
         case 0:
@@ -2207,211 +1690,143 @@ extract_memory_repair_configuration(struct dpu_t *dpu,
     }
 
     // We can repair the memory! Let's choose default values then return the configuration.
-    if (*A_lsbs == 0xFF) {
-        *A_lsbs = 0xF;
+    if (repair_config->A_lsbs == 0xFF) {
+        repair_config->A_lsbs = 0xF;
     }
-    if (*B_lsbs == 0xFF) {
-        *B_lsbs = 0xF;
+    if (repair_config->B_lsbs == 0xFF) {
+        repair_config->B_lsbs = 0xF;
     }
-    if (*C_lsbs == 0xFF) {
-        *C_lsbs = 0xF;
+    if (repair_config->C_lsbs == 0xFF) {
+        repair_config->C_lsbs = 0xF;
     }
-    if (*D_lsbs == 0xFF) {
-        *D_lsbs = 0xF;
-    }
-
-    if (*even_index == 0xFF) {
-        *even_index = 0;
+    if (repair_config->D_lsbs == 0xFF) {
+        repair_config->D_lsbs = 0xF;
     }
 
-    if (*odd_index == 0xFF) {
-        *odd_index = 1;
+    if (repair_config->even_index == 0xFF) {
+        repair_config->even_index = 0;
+    }
+
+    if (repair_config->odd_index == 0xFF) {
+        repair_config->odd_index = 1;
     }
 
     LOG_DPU(DEBUG,
         dpu,
         "valid repair config: AB_MSBs: 0x%02x A_LSBs: 0x%01x B_LSBs: 0x%01x CD_MSBs: 0x%02x C_LSBs: 0x%01x D_LSBs: 0x%01x",
-        *AB_msbs,
-        *A_lsbs,
-        *B_lsbs,
-        *CD_msbs,
-        *C_lsbs,
-        *D_lsbs);
+        repair_config->AB_msbs,
+        repair_config->A_lsbs,
+        repair_config->B_lsbs,
+        repair_config->CD_msbs,
+        repair_config->C_lsbs,
+        repair_config->D_lsbs);
 
     return true;
 }
 
 static dpu_error_t
-try_to_repair_iram(dpu_transaction_t transaction, struct dpu_t *dpu)
+try_to_repair_iram(struct dpu_rank_t *rank)
 {
-    LOG_DPU(VERBOSE, dpu, "");
-    dpu_error_t status;
-    bool fail_to_repair = false;
-    uint8_t AB_msbs, CD_msbs, A_lsbs, B_lsbs, C_lsbs, D_lsbs, even_index, odd_index;
-    dpu_query_t query;
+    dpu_error_t status = DPU_OK;
 
-    struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t dpu_id = dpu->dpu_id;
+    uint8_t nr_cis = rank->description->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus = rank->description->topology.nr_of_dpus_per_control_interface;
 
-    if (!extract_memory_repair_configuration(
-            dpu, &dpu->repair.iram_repair, &AB_msbs, &A_lsbs, &B_lsbs, &CD_msbs, &C_lsbs, &D_lsbs, &even_index, &odd_index)) {
-        LOG_DPU(WARNING, dpu, "ERROR: cannot repair IRAM");
-        fail_to_repair = true;
-        status = DPU_ERR_CORRUPTED_MEMORY;
-        goto end;
+    struct dpu_repair_config configs[DPU_MAX_NR_CIS];
+    struct dpu_repair_config *config_array[DPU_MAX_NR_CIS];
+
+    struct dpu_configuration_slice_info_t *ci_infos = rank->runtime.control_interface.slice_info;
+    bool all_disabled = true;
+
+    for (dpu_slice_id_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
+        config_array[each_ci] = &configs[each_ci];
     }
 
-    safe_add_query(query, dpu_query_build_select_dpu_for_control(slice_id, dpu_id), transaction, status, end);
-    status = dpu_configure_iram_repair_for_previous(
-        rank, slice_id, AB_msbs, A_lsbs, B_lsbs, CD_msbs, C_lsbs, D_lsbs, even_index, odd_index);
+    for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus; ++each_dpu) {
+        uint8_t ci_mask = ALL_CIS;
+
+        for (dpu_slice_id_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_ci, each_dpu);
+
+            if (!extract_memory_repair_configuration(dpu, &dpu->repair.iram_repair, config_array[each_ci])) {
+                LOG_DPU(WARNING, dpu, "ERROR: cannot repair IRAM");
+                dpu->repair.iram_repair.fail_to_repair = true;
+                dpu->enabled = false;
+                ci_infos[each_ci].enabled_dpus &= ~(1 << each_dpu);
+                ci_infos[each_ci].all_dpus_are_enabled = false;
+            }
+        }
+
+        FF(ufi_select_dpu(rank, &ci_mask, each_dpu));
+        FF(ufi_iram_repair_config(rank, ci_mask, config_array));
+    }
+
+    for (dpu_slice_id_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
+        if (ci_infos[each_ci].enabled_dpus) {
+            all_disabled = false;
+            break;
+        }
+    }
+
+    if (all_disabled) {
+        LOG_RANK(WARNING, rank, "No enabled dpus in this rank due to memory corruption.");
+        return DPU_ERR_CORRUPTED_MEMORY;
+    }
 
 end:
-    dpu->repair.iram_repair.fail_to_repair = fail_to_repair;
     return status;
 }
 
 static dpu_error_t
-find_faulty_wram_bits_blocked_at(dpu_transaction_t transaction, struct dpu_rank_t *rank, dpu_slice_id_t slice_id, bool bit_is_set)
+try_to_repair_wram(struct dpu_rank_t *rank)
 {
-    LOG_CI(VERBOSE, rank, slice_id, "");
+    LOG_RANK(VERBOSE, rank, "");
     dpu_error_t status = DPU_OK;
-    dpu_planner_status_e planner_status;
-    dpu_query_t query;
-    dpuword_t *wram_content;
 
-    dpuword_t word_value = bit_is_set ? 0xFFFFFFFF : 0x00000000;
-    uint8_t byte_value = (uint8_t)word_value;
-    uint8_t nb_of_dpus = rank->description->topology.nr_of_dpus_per_control_interface;
-    wram_size_t wram_size = rank->description->memories.wram_size;
-    dpu_selected_mask_t mask_all = rank->runtime.control_interface.slice_info[slice_id].enabled_dpus;
+    uint8_t nr_cis = rank->description->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus = rank->description->topology.nr_of_dpus_per_control_interface;
 
-    wram_content = malloc(wram_size * sizeof(*wram_content));
-    if (wram_content == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto end;
+    struct dpu_repair_config configs[DPU_MAX_NR_CIS];
+    struct dpu_repair_config *config_array[DPU_MAX_NR_CIS];
+
+    struct dpu_configuration_slice_info_t *ci_infos = rank->runtime.control_interface.slice_info;
+    bool all_disabled = true;
+
+    for (dpu_slice_id_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
+        config_array[each_ci] = &configs[each_ci];
     }
 
-    memset(wram_content, byte_value, wram_size * sizeof(*wram_content));
-
-    // Configuration to repair something else than address 0 (for each wram bank)
-    build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    for (uint8_t each_wram_bank = 0; each_wram_bank < NR_OF_WRAM_BANKS; ++each_wram_bank) {
-        status = dpu_configure_wram_repair_for_previous(rank, slice_id, each_wram_bank, 0, 1, 1, 0, 1, 1, 0, 1);
-        if (status != DPU_OK)
-            goto err;
-    }
-
-    // Write + Read address 0 (for each wram bank)
-    safe_add_query(query,
-        dpu_query_build_write_wram_word_for_previous(slice_id, mask_all, 0, wram_content, NR_OF_WRAM_BANKS),
-        transaction,
-        status,
-        err);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    for (dpu_member_id_t each_dpu = 0; each_dpu < nb_of_dpus; ++each_dpu) {
-        struct dpu_t *dpu = dpu_get(rank, slice_id, each_dpu);
-        safe_add_query(query, dpu_query_build_select_dpu_for_control(slice_id, each_dpu), transaction, status, err);
-        safe_add_query(query,
-            dpu_query_build_read_wram_word_for_previous(slice_id, 0, NR_OF_WRAM_BANKS, wram_content),
-            transaction,
-            status,
-            err);
-        safe_execute_transaction(transaction, rank, planner_status, status, err);
-        dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
+    for (dpu_member_id_t each_dpu = 0; each_dpu < nr_dpus; ++each_dpu) {
         for (uint8_t each_wram_bank = 0; each_wram_bank < NR_OF_WRAM_BANKS; ++each_wram_bank) {
-            check_if_memory_address_is_faulty_and_update_context(
-                &dpu->repair.wram_repair[each_wram_bank], 0, word_value, wram_content[each_wram_bank]);
+            uint8_t ci_mask = ALL_CIS;
+
+            for (dpu_slice_id_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
+                struct dpu_t *dpu = DPU_GET_UNSAFE(rank, each_ci, each_dpu);
+
+                if (!extract_memory_repair_configuration(dpu, &dpu->repair.wram_repair[each_wram_bank], config_array[each_ci])) {
+                    LOG_DPU(WARNING, dpu, "ERROR: cannot repair WRAM bank #%d", each_wram_bank);
+                    dpu->repair.wram_repair[each_wram_bank].fail_to_repair = true;
+                    dpu->enabled = false;
+                    ci_infos[each_ci].enabled_dpus &= ~(1 << each_dpu);
+                    ci_infos[each_ci].all_dpus_are_enabled = false;
+                }
+            }
+
+            FF(ufi_select_dpu(rank, &ci_mask, each_dpu));
+            FF(ufi_wram_repair_config(rank, ci_mask, each_wram_bank, config_array));
         }
     }
 
-    // Configuration to repair address 0 (for each wram bank)
-    build_select_query_for_all_enabled_dpus(rank, slice_id, query, transaction, status, err);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-    for (uint8_t each_wram_bank = 0; each_wram_bank < NR_OF_WRAM_BANKS; ++each_wram_bank) {
-        status = dpu_configure_wram_repair_for_previous(rank, slice_id, each_wram_bank, 0, 0, 0, 0, 0, 0, 0, 1);
-        if (status != DPU_OK)
-            goto err;
-    }
-
-    // Write + Read the rest of the WRAM
-    safe_add_query(query,
-        dpu_query_build_write_wram_word_for_previous(
-            slice_id, mask_all, NR_OF_WRAM_BANKS, wram_content + NR_OF_WRAM_BANKS, (wram_size_t)(wram_size - NR_OF_WRAM_BANKS)),
-        transaction,
-        status,
-        err);
-    safe_execute_transaction(transaction, rank, planner_status, status, err);
-
-    for (dpu_member_id_t each_dpu = 0; each_dpu < nb_of_dpus; ++each_dpu) {
-        struct dpu_t *dpu = dpu_get(rank, slice_id, each_dpu);
-        safe_add_query(query, dpu_query_build_select_dpu_for_control(slice_id, each_dpu), transaction, status, err);
-        safe_add_query(query,
-            dpu_query_build_read_wram_word_for_previous(
-                slice_id, NR_OF_WRAM_BANKS, (wram_size_t)(wram_size - NR_OF_WRAM_BANKS), wram_content + NR_OF_WRAM_BANKS),
-            transaction,
-            status,
-            err);
-        safe_execute_transaction(transaction, rank, planner_status, status, err);
-        dpu_transaction_free_queries_for_slice(transaction, slice_id);
-
-        for (wram_addr_t each_address = NR_OF_WRAM_BANKS; each_address < wram_size; ++each_address) {
-            check_if_memory_address_is_faulty_and_update_context(&dpu->repair.wram_repair[each_address % NR_OF_WRAM_BANKS],
-                each_address / NR_OF_WRAM_BANKS,
-                word_value,
-                wram_content[each_address]);
+    for (dpu_slice_id_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
+        if (ci_infos[each_ci].enabled_dpus) {
+            all_disabled = false;
+            break;
         }
     }
 
-err:
-    dpu_transaction_free_queries_for_slice(transaction, slice_id);
-    free(wram_content);
-end:
-    return status;
-}
-
-static dpu_error_t
-try_to_repair_wram(dpu_transaction_t transaction, struct dpu_t *dpu)
-{
-    LOG_DPU(VERBOSE, dpu, "");
-    dpu_error_t status = DPU_OK;
-    uint8_t AB_msbs, CD_msbs, A_lsbs, B_lsbs, C_lsbs, D_lsbs, even_index, odd_index;
-    dpu_query_t query;
-    uint8_t each_wram_bank;
-
-    struct dpu_rank_t *rank = dpu_get_rank(dpu);
-    dpu_slice_id_t slice_id = dpu->slice_id;
-    dpu_member_id_t dpu_id = dpu->dpu_id;
-
-    for (each_wram_bank = 0; each_wram_bank < NR_OF_WRAM_BANKS; ++each_wram_bank) {
-        if (!extract_memory_repair_configuration(dpu,
-                &dpu->repair.wram_repair[each_wram_bank],
-                &AB_msbs,
-                &A_lsbs,
-                &B_lsbs,
-                &CD_msbs,
-                &C_lsbs,
-                &D_lsbs,
-                &even_index,
-                &odd_index)) {
-            LOG_DPU(WARNING, dpu, "ERROR: cannot repair WRAM bank #%d", each_wram_bank);
-            dpu->repair.wram_repair[each_wram_bank].fail_to_repair = true;
-            status = DPU_ERR_CORRUPTED_MEMORY;
-            goto end;
-        }
-
-        safe_add_query(query, dpu_query_build_select_dpu_for_control(slice_id, dpu_id), transaction, status, end);
-        status = dpu_configure_wram_repair_for_previous(
-            rank, slice_id, each_wram_bank, AB_msbs, A_lsbs, B_lsbs, CD_msbs, C_lsbs, D_lsbs, even_index, odd_index);
-        dpu->repair.wram_repair[each_wram_bank].fail_to_repair = false;
+    if (all_disabled) {
+        LOG_RANK(WARNING, rank, "No enabled dpus in this rank due to memory corruption.");
+        return DPU_ERR_CORRUPTED_MEMORY;
     }
 
 end:
@@ -2425,8 +1840,8 @@ nr_cycles_for(double duration_in_ns, double frequency_in_mhz)
 }
 
 static void
-fill_timing_configuration(dpu_dma_engine_configuration_t dma_configuration,
-    dpu_waveform_generator_configuration_t wavegen_configuration,
+fill_timing_configuration(struct dpu_dma_config *dma_configuration,
+    struct dpu_wavegen_config *wavegen_configuration,
     uint32_t fck_frequency,
     uint8_t fck_division,
     uint8_t refresh_mode)
@@ -2500,13 +1915,13 @@ static void
 fetch_dma_and_wavegen_configs(uint32_t fck_frequency,
     uint8_t clock_division,
     uint8_t refresh_mode,
-    struct _dpu_dma_engine_configuration_t *dma_config,
-    struct _dpu_waveform_generator_configuration_t *wavegen_config)
+    struct dpu_dma_config *dma_config,
+    struct dpu_wavegen_config *wavegen_config)
 {
     dpu_clock_division_t clock_div = from_division_factor_to_dpu_enum(clock_division);
 
-    const struct _dpu_dma_engine_configuration_t *reference_dma_config;
-    const struct _dpu_waveform_generator_configuration_t *reference_wavegen_config;
+    const struct dpu_dma_config *reference_dma_config;
+    const struct dpu_wavegen_config *reference_wavegen_config;
 
     switch (clock_div) {
         case DPU_CLOCK_DIV4: {

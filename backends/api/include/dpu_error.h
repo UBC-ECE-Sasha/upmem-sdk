@@ -76,6 +76,7 @@ typedef enum dpu_error_t {
     DPU_ERR_LOG_FORMAT,
     DPU_ERR_LOG_CONTEXT_MISSING,
     DPU_ERR_LOG_BUFFER_TOO_SMALL,
+    DPU_ERR_VPD_INVALID_FILE,
 } dpu_error_t;
 
 /*

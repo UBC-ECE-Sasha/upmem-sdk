@@ -28,6 +28,12 @@
 #define DPU_BOOT_THREAD 0
 
 /**
+ * @def DPU_MAX_NR_GROUPS
+ * @brief Maximum number of groups in a Control Interface.
+ */
+#define DPU_MAX_NR_GROUPS 8
+
+/**
  * @typedef dpu_rank_id_t
  * @brief ID of a DPU rank.
  */
@@ -133,32 +139,15 @@ typedef uint32_t dpuword_t;
  * @typedef dpu_bitfield_t
  * @brief Bitfield of DPUs in a CI.
  */
-typedef uint32_t dpu_bitfield_t;
+typedef uint8_t dpu_bitfield_t;
+
+#define DPU_BITFIELD_ALL ((dpu_bitfield_t)-1)
 
 /**
  * @typedef dpu_ci_bitfield_t
  * @brief Bitfield of CIs in a rank.
  */
 typedef uint8_t dpu_ci_bitfield_t;
-
-typedef enum _dpu_pc_mode_e {
-    DPU_PC_12 = 0,
-    DPU_PC_13 = 1,
-    DPU_PC_14 = 2,
-    DPU_PC_15 = 3,
-    DPU_PC_16 = 4,
-} dpu_pc_mode_e;
-
-typedef enum {
-    DPU_TEMPERATURE_LESS_THAN_50 = 0,
-    DPU_TEMPERATURE_BETWEEN_50_AND_60 = 1,
-    DPU_TEMPERATURE_BETWEEN_60_AND_70 = 2,
-    DPU_TEMPERATURE_BETWEEN_70_AND_80 = 3,
-    DPU_TEMPERATURE_BETWEEN_80_AND_90 = 4,
-    DPU_TEMPERATURE_BETWEEN_90_AND_100 = 5,
-    DPU_TEMPERATURE_BETWEEN_100_AND_110 = 6,
-    DPU_TEMPERATURE_GREATER_THAN_110 = 7,
-} dpu_temperature_e;
 
 typedef enum _dpu_clock_division_t {
     DPU_CLOCK_DIV8 = 0x0,
@@ -167,22 +156,21 @@ typedef enum _dpu_clock_division_t {
     DPU_CLOCK_DIV2 = 0x8,
 } dpu_clock_division_t;
 
-typedef enum _dpu_slice_target_type_e {
-    DPU_SLICE_TARGET_CONTROL,
+enum dpu_slice_target_type {
+    DPU_SLICE_TARGET_NONE,
     DPU_SLICE_TARGET_DPU,
     DPU_SLICE_TARGET_ALL,
-    DPU_SLICE_TARGET_PREVIOUS,
     DPU_SLICE_TARGET_GROUP,
     NR_OF_DPU_SLICE_TARGETS
-} dpu_slice_target_type_e;
+};
 
-typedef struct _dpu_slice_target_t {
-    dpu_slice_target_type_e type;
+struct dpu_slice_target {
+    enum dpu_slice_target_type type;
     union {
         dpu_member_id_t dpu_id;
         dpu_group_id_t group_id;
     };
-} * dpu_slice_target_t;
+};
 
 #define DPU_SLICE_TARGET_TYPE_NAME(target_type)                                                                                  \
     ((((uint32_t)(target_type)) < NR_OF_DPU_SLICE_TARGETS) ? dpu_slice_target_names[target_type]                                 \
@@ -248,6 +236,51 @@ struct dpu_symbol_t {
 struct dpu_incbin_t {
     uint8_t *buffer;
     size_t size;
+    const char *path;
+};
+
+struct dpu_bit_config {
+    uint16_t cpu2dpu;
+    uint16_t dpu2cpu;
+    uint8_t nibble_swap;
+    uint8_t stutter;
+};
+
+struct dpu_carousel_config {
+    uint8_t cmd_duration;
+    uint8_t cmd_sampling;
+    uint8_t res_duration;
+    uint8_t res_sampling;
+};
+
+struct dpu_repair_config {
+    uint8_t AB_msbs;
+    uint8_t CD_msbs;
+    uint8_t A_lsbs;
+    uint8_t B_lsbs;
+    uint8_t C_lsbs;
+    uint8_t D_lsbs;
+    uint8_t even_index;
+    uint8_t odd_index;
+};
+
+enum dpu_temperature {
+    DPU_TEMPERATURE_LESS_THAN_50 = 0,
+    DPU_TEMPERATURE_BETWEEN_50_AND_60 = 1,
+    DPU_TEMPERATURE_BETWEEN_60_AND_70 = 2,
+    DPU_TEMPERATURE_BETWEEN_70_AND_80 = 3,
+    DPU_TEMPERATURE_BETWEEN_80_AND_90 = 4,
+    DPU_TEMPERATURE_BETWEEN_90_AND_100 = 5,
+    DPU_TEMPERATURE_BETWEEN_100_AND_110 = 6,
+    DPU_TEMPERATURE_GREATER_THAN_110 = 7,
+};
+
+enum dpu_pc_mode {
+    DPU_PC_MODE_12 = 0,
+    DPU_PC_MODE_13 = 1,
+    DPU_PC_MODE_14 = 2,
+    DPU_PC_MODE_15 = 3,
+    DPU_PC_MODE_16 = 4,
 };
 
 #endif // DPU_TYPES_H

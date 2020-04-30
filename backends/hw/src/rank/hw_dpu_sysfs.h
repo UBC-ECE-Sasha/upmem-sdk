@@ -96,4 +96,10 @@ dpu_sysfs_get_hardware_description(dpu_description_t description, uint8_t *capab
 int
 dpu_sysfs_get_kernel_module_version(unsigned int *major, unsigned int *minor);
 
+int
+dpu_sysfs_get_dimm_serial_number(const char *rank_path, char **serial_number);
+
+int
+dpu_sysfs_get_rank_index(const char *rank_path, int *index);
+
 #endif /* HW_DPU_SYSFS_H */

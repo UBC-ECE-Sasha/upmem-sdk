@@ -11,7 +11,6 @@
 
 #include <dpu_types.h>
 #include <dpu_chip_id.h>
-#include <dpu_pcb_transformation.h>
 
 /**
  * @file dpu_description.h
@@ -29,10 +28,7 @@ typedef struct _dpu_description_t {
     } signature;
 
     struct {
-        uint8_t cmd_duration;
-        uint8_t cmd_sampling;
-        uint8_t res_duration;
-        uint8_t res_sampling;
+        struct dpu_carousel_config carousel;
         uint8_t reset_wait_duration;
         uint8_t std_temperature;
         uint8_t clock_division;
@@ -69,7 +65,9 @@ typedef struct _dpu_description_t {
 
         bool disable_api_safe_checks;
 
-        struct _dpu_pcb_transformation_t pcb_transformation;
+        bool disable_reset_on_alloc;
+
+        struct dpu_bit_config pcb_transformation;
         uint32_t fck_frequency_in_mhz;
     } configuration;
 

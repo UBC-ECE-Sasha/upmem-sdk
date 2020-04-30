@@ -24,10 +24,6 @@ __FOR_EACH_THREAD(DECLARE_STACK);
 
 thread_stack_t __keep __dma_aligned __SP_TABLE__[NR_THREADS] = { __FOR_EACH_THREAD(SET_STACK_TABLE_PTR) };
 
-uint32_t __keep __sys_thread_nanostack_entry_0[NR_THREADS];
-uint32_t __keep __sys_thread_nanostack_entry_1[NR_THREADS];
-uint32_t __keep __sys_thread_nanostack_entry_2[NR_THREADS];
-
 void __attribute__((naked, used, section(".text.__bootstrap"), no_instrument_function)) __bootstrap()
 {
     /* clang-format off */

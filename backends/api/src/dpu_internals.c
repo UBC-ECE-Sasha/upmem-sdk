@@ -10,11 +10,12 @@
 #include <dpu_api_log.h>
 #include <dpu_rank.h>
 #include <dpu_mask.h>
-#include <ufi_utils.h>
 #include <verbose_control.h>
+#include <dpu/ufi.h>
+#include <dpu_internals.h>
 
 dpu_error_t
-drain_pipeline(struct dpu_t *dpu, dpu_context_t context, dpu_pc_mode_e pc_mode, bool should_add_to_schedule)
+drain_pipeline(struct dpu_t *dpu, dpu_context_t context, bool should_add_to_schedule)
 {
     LOG_DPU(VERBOSE, dpu, "");
     dpu_error_t status = DPU_OK;
@@ -23,15 +24,9 @@ drain_pipeline(struct dpu_t *dpu, dpu_context_t context, dpu_pc_mode_e pc_mode, 
     dpu_member_id_t member_id = dpu->dpu_id;
 
     uint8_t nr_of_threads_per_dpu = rank->description->dpu.nr_of_threads;
-    dpu_planner_status_e planner_status;
-    dpu_transaction_t transaction;
-    dpu_query_t query;
     bool still_draining;
-    uint8_t lsb_pc;
-    uint8_t msb_pc;
-    uint8_t nr_of_bits_in_lsb_pc;
-    uint32_t *previous_run_register;
-    uint32_t *run_register;
+    uint32_t *previous_run_register = NULL;
+    uint32_t *run_register = NULL;
     dpu_selected_mask_t mask_one = dpu_mask_one(member_id);
 
     if ((previous_run_register = malloc(nr_of_threads_per_dpu * sizeof(*previous_run_register))) == NULL) {
@@ -40,45 +35,18 @@ drain_pipeline(struct dpu_t *dpu, dpu_context_t context, dpu_pc_mode_e pc_mode, 
     }
     if ((run_register = malloc(nr_of_threads_per_dpu * sizeof(*run_register))) == NULL) {
         status = DPU_ERR_SYSTEM;
-        goto free_previous_run_register;
+        goto end;
     }
 
-    if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-        status = DPU_ERR_SYSTEM;
-        goto free_run_register;
-    }
+    uint8_t mask = CI_MASK_ONE(slice_id);
+    uint8_t result[DPU_MAX_NR_CIS];
+
+    FF(ufi_select_dpu(rank, &mask, member_id));
 
     // 1. Fetching initial RUN register
     for (dpu_thread_t each_thread = 0; each_thread < nr_of_threads_per_dpu; ++each_thread) {
-        safe_add_query(query,
-            dpu_query_build_read_run_thread_for_dpu(slice_id, member_id, each_thread, previous_run_register + each_thread),
-            transaction,
-            status,
-            free_transaction);
-    }
-    safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-    dpu_transaction_free(transaction);
-
-    switch (pc_mode) {
-        case DPU_PC_12:
-            nr_of_bits_in_lsb_pc = 6;
-            break;
-        case DPU_PC_13:
-            nr_of_bits_in_lsb_pc = 7;
-            break;
-        case DPU_PC_14:
-            nr_of_bits_in_lsb_pc = 7;
-            break;
-        case DPU_PC_15:
-            nr_of_bits_in_lsb_pc = 8;
-            break;
-        case DPU_PC_16:
-            nr_of_bits_in_lsb_pc = 8;
-            break;
-        default:
-            nr_of_bits_in_lsb_pc = 8;
-            break;
+        FF(ufi_read_run_bit(rank, mask, each_thread, result));
+        previous_run_register[each_thread] = result[slice_id];
     }
 
     // 2. Initial RUN register can be null: draining is done
@@ -91,38 +59,28 @@ drain_pipeline(struct dpu_t *dpu, dpu_context_t context, dpu_pc_mode_e pc_mode, 
     }
 
     if (still_draining) {
-        // 3. Looping until there is no more running thread
-        if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-            status = DPU_ERR_SYSTEM;
-            goto free_run_register;
-        }
-        // 3.1 Set replacing instruction to a STOP
-        safe_add_query(
-            query, dpu_query_build_debug_std_replace_stop_enabled_for_previous(slice_id), transaction, status, free_transaction);
-        // 3.2 Popping out a thread from the FIFO
-        safe_add_query(
-            query, dpu_query_build_set_and_step_dpu_fault_state_for_previous(slice_id), transaction, status, free_transaction);
-        // 3.3 Fetching potential PC (if a thread has been popped out)
-        safe_add_query(query, dpu_query_build_read_pc_lsb_for_previous(slice_id, &lsb_pc), transaction, status, free_transaction);
-        safe_add_query(query, dpu_query_build_read_pc_msb_for_previous(slice_id, &msb_pc), transaction, status, free_transaction);
-        // 3.4 Fetching new RUN register
-        for (dpu_thread_t each_thread = 0; each_thread < nr_of_threads_per_dpu; ++each_thread) {
-            safe_add_query(query,
-                dpu_query_build_read_run_thread_for_previous(slice_id, each_thread, run_register + each_thread),
-                transaction,
-                status,
-                free_transaction);
-        }
-
         do {
-            safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
+            iram_addr_t pc_results[DPU_MAX_NR_CIS];
+            // 3. Looping until there is no more running thread
+            // 3.1 Set replacing instruction to a STOP
+            FF(ufi_debug_replace_stop(rank, mask));
+            // 3.2 Popping out a thread from the FIFO
+            FF(ufi_set_dpu_fault_and_step(rank, mask));
+            // 3.3 Fetching potential PC (if a thread has been popped out)
+            FF(ufi_debug_pc_read(rank, mask, pc_results));
+            iram_addr_t pc = pc_results[slice_id];
+            // 3.4 Fetching new RUN register
+            for (dpu_thread_t each_thread = 0; each_thread < nr_of_threads_per_dpu; ++each_thread) {
+                FF(ufi_read_run_bit(rank, mask, each_thread, result));
+                run_register[each_thread] = result[slice_id];
+            }
 
             still_draining = false;
             for (dpu_thread_t each_thread = 0; each_thread < nr_of_threads_per_dpu; ++each_thread) {
                 if ((run_register[each_thread] & mask_one) != 0) {
                     still_draining = true;
                 } else if (context && (previous_run_register[each_thread] & mask_one) != 0) {
-                    context->pcs[each_thread] = lsb_pc | (msb_pc << nr_of_bits_in_lsb_pc);
+                    context->pcs[each_thread] = pc;
                     if (should_add_to_schedule) {
                         context->scheduling[each_thread] = context->nr_of_running_threads++;
                     }
@@ -131,56 +89,14 @@ drain_pipeline(struct dpu_t *dpu, dpu_context_t context, dpu_pc_mode_e pc_mode, 
             }
         } while (still_draining);
 
-        dpu_transaction_free(transaction);
-
         // 4. Clear dbg_replace_en
-        if ((transaction = dpu_transaction_new(rank->description->topology.nr_of_control_interfaces)) == NULL) {
-            status = DPU_ERR_SYSTEM;
-            goto free_run_register;
-        }
-
-        safe_add_query(
-            query, dpu_query_build_debug_std_replace_clear_for_previous(slice_id), transaction, status, free_transaction);
-
-        safe_execute_transaction(transaction, rank, planner_status, status, free_transaction);
-
-        dpu_transaction_free(transaction);
+        FF(ufi_clear_debug_replace(rank, mask));
     }
 
-    goto free_run_register;
-
-free_transaction:
-    dpu_transaction_free(transaction);
-free_run_register:
-    free(run_register);
-free_previous_run_register:
-    free(previous_run_register);
 end:
+    free(run_register);
+    free(previous_run_register);
     return status;
-}
-
-bool
-fetch_natural_pc_mode(struct dpu_rank_t *rank, dpu_pc_mode_e *pc_mode)
-{
-    switch (rank->description->memories.iram_size) {
-        case 1 << 12:
-            *pc_mode = DPU_PC_12;
-            break;
-        case 1 << 13:
-            *pc_mode = DPU_PC_13;
-            break;
-        case 1 << 14:
-            *pc_mode = DPU_PC_14;
-            break;
-        case 1 << 15:
-            *pc_mode = DPU_PC_15;
-            break;
-        default:
-            *pc_mode = DPU_PC_16;
-            break;
-    }
-
-    return true;
 }
 
 void
@@ -210,5 +126,24 @@ from_division_factor_to_dpu_enum(uint8_t factor)
             return DPU_CLOCK_DIV4;
         case 8:
             return DPU_CLOCK_DIV8;
+    }
+}
+
+dpu_error_t
+map_rank_status_to_api_status(dpu_rank_status_e rank_status)
+{
+    switch (rank_status) {
+        case DPU_RANK_SUCCESS:
+            return DPU_OK;
+        case DPU_RANK_COMMUNICATION_ERROR:
+            return DPU_ERR_DRIVER;
+        case DPU_RANK_BACKEND_ERROR:
+            return DPU_ERR_DRIVER;
+        case DPU_RANK_SYSTEM_ERROR:
+            return DPU_ERR_SYSTEM;
+        case DPU_RANK_INVALID_PROPERTY_ERROR:
+            return DPU_ERR_INVALID_PROFILE;
+        default:
+            return DPU_ERR_INTERNAL;
     }
 }

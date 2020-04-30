@@ -12,11 +12,12 @@ volatile unsigned int __sys_heap_pointer = (unsigned int)(&__sys_heap_pointer_re
 
 ATOMIC_BIT_INIT(__heap_pointer);
 
-// noinline, because part of grind tracked functions
+/* noinline, because part of grind tracked functions
+ * Also used by seqread.inc
+ */
 void *__noinline
-mem_alloc(size_t size)
+mem_alloc_nolock(size_t size)
 {
-    ATOMIC_BIT_ACQUIRE(__heap_pointer);
     unsigned int pointer = __HEAP_POINTER;
 
     if (size != 0) {
@@ -32,9 +33,16 @@ mem_alloc(size_t size)
 
         __HEAP_POINTER = new_heap_pointer;
     }
-
-    ATOMIC_BIT_RELEASE(__heap_pointer);
     return (void *)pointer;
+}
+
+void *
+mem_alloc(size_t size)
+{
+    ATOMIC_BIT_ACQUIRE(__heap_pointer);
+    void *pointer = mem_alloc_nolock(size);
+    ATOMIC_BIT_RELEASE(__heap_pointer);
+    return pointer;
 }
 
 void *

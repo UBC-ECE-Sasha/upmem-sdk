@@ -25,7 +25,8 @@ set(CMAKE_BUILD_TYPE RelWithDebInfo)
 set(CMAKE_C_STANDARD 11)
 set(STRICT_FLAGS -Wall -Wextra -Werror)
 set(NOSTDLIB_FLAGS -nostdlib -nostdinc -Wno-incompatible-library-redeclaration)
-set(COMPILE_LTO_FLAGS -flto=thin)
+set(COMPILE_LTO_FLAGS -flto)
+set(COMPILE_LTO_THIN_FLAGS -flto=thin)
 set(PROFILING_FLAGS -pg)
 
 set(STDLIB_DIR src/stdlib)
@@ -165,7 +166,6 @@ set(SYSLIB_C_SOURCES
         ${SYSLIB_DIR}/listener.c
         ${SYSLIB_DIR}/lshrdi3.c
         ${SYSLIB_DIR}/macro_utils.h
-        ${SYSLIB_DIR}/mcount.c
         ${SYSLIB_DIR}/moddi3.c
         ${SYSLIB_DIR}/modsi3.c
         ${SYSLIB_DIR}/mram.h
@@ -194,10 +194,12 @@ set(SYSLIB_C_SOURCES
         ${SYSLIB_DIR}/powisf2.c
         ${SYSLIB_DIR}/sem.c
         ${SYSLIB_DIR}/sem.h
-        ${SYSLIB_DIR}/seqread128.c
-        ${SYSLIB_DIR}/seqread256.c
         ${SYSLIB_DIR}/seqread32.c
         ${SYSLIB_DIR}/seqread64.c
+        ${SYSLIB_DIR}/seqread128.c
+        ${SYSLIB_DIR}/seqread256.c
+        ${SYSLIB_DIR}/seqread512.c
+        ${SYSLIB_DIR}/seqread1024.c
         ${SYSLIB_DIR}/seqread.h
         ${SYSLIB_DIR}/soft_cache.c
         ${SYSLIB_DIR}/soft_cache.h
@@ -231,19 +233,23 @@ set(ALL_SOURCES ${STDLIB_C_SOURCES} ${SYSLIB_C_SOURCES})
 set(INCLUDE_DIRECTORIES ${STDLIB_DIR} ${SYSLIB_DIR})
 
 function(add_dpu_library)
-    cmake_parse_arguments(DPU_LIB "PROFILING;LTO" "TARGET" "SOURCES" ${ARGN})
+    cmake_parse_arguments(DPU_LIB "PROFILING;LTO;LTO_THIN" "TARGET" "SOURCES" ${ARGN})
     set(OTHER_FLAGS "")
+
+    if (DPU_LIB_PROFILING)
+        set(OTHER_FLAGS ${OTHER_FLAGS} ${PROFILING_FLAGS})
+    endif()
 
     if (DPU_LIB_LTO)
         set(OTHER_FLAGS ${OTHER_FLAGS} ${COMPILE_LTO_FLAGS})
     endif()
 
+    if (DPU_LIB_LTO_THIN)
+        set(OTHER_FLAGS ${OTHER_FLAGS} ${COMPILE_LTO_THIN_FLAGS})
+    endif()
+
     add_library(${DPU_LIB_TARGET} STATIC "${DPU_LIB_SOURCES}")
     target_include_directories(${DPU_LIB_TARGET} PRIVATE ${INCLUDE_DIRECTORIES})
-
-    if (DPU_LIB_PROFILING)
-        set(OTHER_FLAGS ${OTHER_FLAGS} ${PROFILING_FLAGS})
-    endif()
 
     target_compile_options(${DPU_LIB_TARGET} PRIVATE ${NOSTDLIB_FLAGS} ${STRICT_FLAGS} ${COMPILER_TIMESTAMP_DEF} ${OTHER_FLAGS})
 
@@ -254,20 +260,25 @@ function(add_dpu_library)
         )
 endfunction()
 
-add_dpu_library(TARGET rt                    SOURCES ${ALL_SOURCES})
-add_dpu_library(TARGET rt_p        PROFILING SOURCES ${ALL_SOURCES})
-add_dpu_library(TARGET rtlto   LTO           SOURCES ${ALL_SOURCES})
-add_dpu_library(TARGET rtlto_p LTO PROFILING SOURCES ${ALL_SOURCES})
+add_dpu_library(TARGET rt                             SOURCES ${ALL_SOURCES})
+add_dpu_library(TARGET rt_p                 PROFILING SOURCES ${ALL_SOURCES})
+add_dpu_library(TARGET rtlto       LTO                SOURCES ${ALL_SOURCES})
+add_dpu_library(TARGET rtlto_p     LTO      PROFILING SOURCES ${ALL_SOURCES})
+add_dpu_library(TARGET rtltothin   LTO_THIN           SOURCES ${ALL_SOURCES})
+add_dpu_library(TARGET rtltothin_p LTO_THIN PROFILING SOURCES ${ALL_SOURCES})
+
+add_library(rtmcount STATIC ${SYSLIB_DIR}/mcount.c)
+target_compile_options(rtmcount PRIVATE ${NOSTDLIB_FLAGS} ${STRICT_FLAGS} ${COMPILER_TIMESTAMP_DEF})
+install(
+    TARGETS rtmcount
+    ARCHIVE
+    DESTINATION share/upmem/include/built-in
+    )
 
 install(
     DIRECTORY ${STDLIB_DIR} ${SYSLIB_DIR}
     DESTINATION share/upmem/include
     FILES_MATCHING PATTERN "*.h"
-    )
-
-install(
-    FILES ${SYSLIB_DIR}/sysdefs.S
-    DESTINATION share/upmem/include/syslib
     )
 
 install(

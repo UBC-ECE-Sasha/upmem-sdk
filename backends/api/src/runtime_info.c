@@ -8,8 +8,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
-#include "dpu_elf.h"
-#include "runtime_info.h"
+#include <dpu_elf.h>
 
 typedef char rte_symbol[64];
 typedef struct _runtime_symbol_info {

@@ -13,15 +13,13 @@ find_package(LibElf REQUIRED)
 set( JAVA_HEADERS "${JAVA_INCLUDE_PATH}" "${JAVA_INCLUDE_PATH2}" )
 
 set(VC_INCLUDE_DIRECTORIES ../verbose/src)
-set(INCLUDE_DIRECTORIES include/ ${VC_INCLUDE_DIRECTORIES} ${LIBELF_INCLUDE_DIR})
+set(UFI_INCLUDE_DIRECTORIES ../ufi/src ../ufi/include)
+set(COMMONS_INCLUDE_DIRECTORIES ../commons/include ../commons/src ../commons/src/properties)
+set(INCLUDE_DIRECTORIES include src/include ${UFI_INCLUDE_DIRECTORIES} ${COMMONS_INCLUDE_DIRECTORIES} ${VC_INCLUDE_DIRECTORIES} ${LIBELF_INCLUDE_DIR})
 
 set(PROPERTIES_SOURCES
         ../commons/src/properties/dpu_properties.c
         ../commons/src/properties/dpu_properties_loader.c
-        )
-
-set(PCB_SOURCES
-        ../commons/src/pcb/dpu_pcb_transformation.c
         )
 
 set(DESCRIPTION_SOURCES
@@ -30,7 +28,6 @@ set(DESCRIPTION_SOURCES
 
 set(COMMONS_SOURCES
         ${PROPERTIES_SOURCES}
-        ${PCB_SOURCES}
         ${DESCRIPTION_SOURCES}
         ../commons/src/dpu_predef_programs.c
         ../commons/src/dpu_package.c
@@ -54,7 +51,10 @@ set(SOURCES
         src/dpu_runner.c
 
         src/runtime_info.c
-        src/ufi_utils.c
+
+        ../ufi/src/ufi.c
+        ../ufi/src/ufi_bit_config.c
+        ../ufi/src/ufi_ci.c
         )
 
 set(ALL_SOURCES ${SOURCES} ${COMMONS_SOURCES})
@@ -65,7 +65,7 @@ set(JNI_SOURCES
 
 add_library( dpu SHARED ${ALL_SOURCES} )
 target_include_directories( dpu PUBLIC ${INCLUDE_DIRECTORIES} )
-target_link_libraries( dpu m ${CMAKE_DL_LIBS} ${CMAKE_THREAD_LIBS_INIT} ${LIBELF_LIBRARIES} dpu-ufi dpuverbose )
+target_link_libraries( dpu m ${CMAKE_DL_LIBS} ${CMAKE_THREAD_LIBS_INIT} ${LIBELF_LIBRARIES} dpuverbose )
 target_compile_definitions(dpu PUBLIC DPU_TOOLS_VERSION=${UPMEM_VERSION})
 set_target_properties(dpu PROPERTIES VERSION ${UPMEM_VERSION})
 
@@ -104,5 +104,4 @@ if (IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
     deftest(ReadWriteWramTest)
     deftest(ReadWriteIramTest)
     deftest(ReadWriteMramTest)
-    deftest(BitOrderingTest)
 endif()

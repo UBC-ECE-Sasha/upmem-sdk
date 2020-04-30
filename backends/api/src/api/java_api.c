@@ -159,7 +159,7 @@ Java_com_upmem_dpujni_DpuJNI_resetDpu(__UNUSED_PARAM__ JNIEnv *env,
     jint ci_id,
     jint dpu_id)
 {
-    dpu_soft_reset_dpu(dpu_get(_this_rank(lp), (dpu_slice_id_t)ci_id, (dpu_member_id_t)dpu_id));
+    (void)dpu_reset_dpu(dpu_get(_this_rank(lp), (dpu_slice_id_t)ci_id, (dpu_member_id_t)dpu_id));
 
     flush_outputs();
     return lp;

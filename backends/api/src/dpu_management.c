@@ -15,6 +15,7 @@
 #include <dpu_profile.h>
 #include <dpu_api_log.h>
 #include <dpu_properties_loader.h>
+#include <dpu_internals.h>
 
 #define API_DEFAULT_BACKEND HW
 
@@ -23,13 +24,12 @@ dpu_get(struct dpu_rank_t *rank, dpu_slice_id_t slice_id, dpu_member_id_t dpu_id
 {
     uint8_t nr_slices = rank->description->topology.nr_of_control_interfaces;
     uint8_t nr_dpus = rank->description->topology.nr_of_dpus_per_control_interface;
-    uint32_t dpu_index = (nr_dpus * slice_id) + dpu_id;
 
     if ((slice_id >= nr_slices) || (dpu_id >= nr_dpus)) {
         return NULL;
     }
 
-    return rank->dpus + dpu_index;
+    return rank->dpus + DPU_INDEX(rank, slice_id, dpu_id);
 }
 
 __API_SYMBOL__ struct dpu_rank_t *
@@ -182,7 +182,7 @@ dpu_get_profiling_properties(struct dpu_rank_t *dpu_rank, dpu_properties_t prope
     } else
         slice_id = 0;
 
-    dpu_rank->profiling_context.dpu = dpu_get(dpu_rank, slice_id, dpu_id);
+    dpu_rank->profiling_context.dpu = DPU_GET_UNSAFE(dpu_rank, slice_id, dpu_id);
 
     if (!enable_profiling) {
         /* If profiling is not explicitly required by user, we must nopify all mcount references if any */
@@ -252,7 +252,8 @@ dpu_get_rank_of_type(const char *profile, struct dpu_rank_t **rank)
     dpu_error_t status;
     struct dpu_rank_t *dpu_rank;
     dpu_properties_t properties;
-    bool disable_mux_switch;
+    bool disable_mux_switch, disable_reset_on_alloc;
+    uint64_t debug_cmds_buffer_size;
 
     properties = dpu_properties_load_from_profile(profile);
     if (properties == DPU_PROPERTIES_INVALID) {
@@ -296,24 +297,52 @@ dpu_get_rank_of_type(const char *profile, struct dpu_rank_t **rank)
         dpu_rank->description->configuration.api_must_switch_mram_mux = false;
     }
 
+    /* Reset on alloc disable */
+    if (!fetch_boolean_property(properties, DPU_PROFILE_PROPERTY_DISABLE_RESET_ON_ALLOC, &disable_reset_on_alloc, false)) {
+        status = DPU_ERR_INTERNAL;
+        goto free_dpus;
+    }
+    dpu_rank->description->configuration.disable_reset_on_alloc = disable_reset_on_alloc;
+
+    /* Debug commands buffer */
+#define DEBUG_CMDS_BUFFER_SIZE_DEFAULT 1000
+    if (!fetch_long_property(
+            properties, DPU_PROFILE_PROPERTY_DEBUG_CMDS_BUFFER_SIZE, &debug_cmds_buffer_size, DEBUG_CMDS_BUFFER_SIZE_DEFAULT)) {
+        status = DPU_ERR_INTERNAL;
+        goto free_dpus;
+    }
+    dpu_rank->debug.cmds_buffer.size = debug_cmds_buffer_size;
+    if (LOGD_ENABLED(get_verbose_control_for("ufi"))) {
+        dpu_rank->debug.cmds_buffer.cmds = calloc(debug_cmds_buffer_size, sizeof(struct dpu_command_t));
+        if (!dpu_rank->debug.cmds_buffer.cmds) {
+            return DPU_ERR_INTERNAL;
+        }
+        dpu_rank->debug.cmds_buffer.nb = 0;
+        dpu_rank->debug.cmds_buffer.idx_last = 0;
+        dpu_rank->debug.cmds_buffer.has_wrapped = false;
+    } else
+        dpu_rank->debug.cmds_buffer.cmds = NULL;
+
     dpu_properties_log_unused(properties, __vc());
 
     pthread_mutexattr_t mutex_attr;
     if (pthread_mutexattr_init(&mutex_attr) != 0) {
         status = DPU_ERR_SYSTEM;
-        goto free_dpus;
+        goto free_cmds_buffer;
     }
     pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE);
     if (pthread_mutex_init(&(dpu_rank->mutex), &mutex_attr) != 0) {
         pthread_mutexattr_destroy(&mutex_attr);
         status = DPU_ERR_SYSTEM;
-        goto free_dpus;
+        goto free_cmds_buffer;
     }
     pthread_mutexattr_destroy(&mutex_attr);
 
     *rank = dpu_rank;
     goto delete_properties;
 
+free_cmds_buffer:
+    free(dpu_rank->debug.cmds_buffer.cmds);
 free_dpus:
     free(dpu_rank->dpus);
 release_handler:
@@ -376,6 +405,8 @@ dpu_free_rank(struct dpu_rank_t *rank)
     if (rank->profiling_context.sample_stats) {
         free(rank->profiling_context.sample_stats);
     }
+
+    free(rank->debug.cmds_buffer.cmds);
 
     dpu_lock_rank(rank);
     dpu_rank_handler_free_rank(rank, rank->handler_context);

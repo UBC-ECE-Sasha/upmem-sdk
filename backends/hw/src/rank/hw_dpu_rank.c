@@ -20,10 +20,13 @@
 #include <dpu_program.h>
 #include <dpu_mask.h>
 #include <dpu_log_utils.h>
+#include <dpu_vpd.h>
+#include <dpu_internals.h>
 
 #include "dpu_attributes.h"
 // TODO: will conflict with driver header
 #include "dpu_rank.h"
+#include "dpu_mask.h"
 
 /* Header shared with driver */
 #include "dpu_region_address_translation.h"
@@ -35,6 +38,9 @@
 #include "dpu_module_compatibility.h"
 
 #include "static_verbose.h"
+
+const char *
+get_rank_path(dpu_description_t description);
 
 static struct verbose_control *this_vc;
 static struct verbose_control *
@@ -71,9 +77,9 @@ hw_allocate(struct dpu_rank_t *rank, dpu_description_t description);
 static dpu_rank_status_e
 hw_free(struct dpu_rank_t *rank);
 static dpu_rank_status_e
-hw_commit_commands(struct dpu_rank_t *rank, dpu_rank_buffer_t *buffer);
+hw_commit_commands(struct dpu_rank_t *rank, dpu_rank_buffer_t buffer);
 static dpu_rank_status_e
-hw_update_commands(struct dpu_rank_t *rank, dpu_rank_buffer_t *buffer);
+hw_update_commands(struct dpu_rank_t *rank, dpu_rank_buffer_t buffer);
 static dpu_rank_status_e
 hw_copy_to_rank(struct dpu_rank_t *rank, struct dpu_transfer_mram *transfer_matrix);
 static dpu_rank_status_e
@@ -89,7 +95,7 @@ hw_custom_operation(struct dpu_rank_t *rank,
 static void
 hw_print_lldb_message_on_fault(struct dpu_t *dpu, dpu_slice_id_t slice_id, dpu_member_id_t dpu_id);
 
-const __API_SYMBOL__ struct _dpu_rank_handler_t hw_dpu_rank_handler = {
+const __API_SYMBOL__ struct dpu_rank_handler hw_dpu_rank_handler = {
     .allocate = hw_allocate,
     .free = hw_free,
     .commit_commands = hw_commit_commands,
@@ -256,6 +262,127 @@ get_array_ci_mapping(dpu_description_t description)
     return ci_mapping;
 }
 
+static int
+open_vpd_file(struct dpu_rank_t *rank, FILE **vpd)
+{
+    int status;
+
+    const char *rank_path = get_rank_path(rank->description);
+    char *dimm_serial_number = NULL;
+    char *dimm_vpd_file = NULL;
+
+    status = dpu_sysfs_get_dimm_serial_number(rank_path, &dimm_serial_number);
+    if (status != 0) {
+        return status;
+    }
+
+    if (asprintf(&dimm_vpd_file, "/usr/share/upmem/dimm-quirks/UPM%s.vpd", dimm_serial_number) == -1) {
+        free(dimm_serial_number);
+        return -ENOMEM;
+    }
+    free(dimm_serial_number);
+
+    *vpd = fopen(dimm_vpd_file, "r");
+    if (*vpd == NULL) {
+        LOG_RANK(WARNING, rank, "unable to find %s", dimm_vpd_file);
+        free(dimm_vpd_file);
+        return -errno;
+    }
+
+    LOG_RANK(INFO, rank, "found %s", dimm_vpd_file);
+    free(dimm_vpd_file);
+
+    return 0;
+}
+
+static dpu_error_t
+fill_sram_repairs_and_update_enabled_dpus(struct dpu_rank_t *rank)
+{
+    int status;
+
+    FILE *vpd = NULL;
+    const char *rank_path = get_rank_path(rank->description);
+    int rank_index;
+
+    status = open_vpd_file(rank, &vpd);
+    if (status != 0) {
+        LOG_RANK(WARNING, rank, "unable to open VPD file");
+        return DPU_ERR_SYSTEM;
+    }
+
+    status = dpu_sysfs_get_rank_index(rank_path, &rank_index);
+    if (status != 0) {
+        LOG_RANK(WARNING, rank, "unable to get rank index");
+        return DPU_ERR_SYSTEM;
+    }
+
+    struct dimm_vpd dimm_vpd;
+    bool repair_requested
+        = (rank->description->configuration.do_iram_repair) || (rank->description->configuration.do_wram_repair);
+    struct repair_entry entry;
+    uint16_t repair_cnt = 0;
+
+    if (fread(&dimm_vpd, sizeof(dimm_vpd), 1, vpd) != 1) {
+        LOG_RANK(WARNING, rank, "unable to parse VPD file");
+        return DPU_ERR_VPD_INVALID_FILE;
+    }
+
+    if (memcmp(dimm_vpd.struct_id, VPD_STRUCT_ID, sizeof(dimm_vpd.struct_id)) != 0) {
+        LOG_RANK(WARNING, rank, "invalid VPD structure ID");
+        return DPU_ERR_VPD_INVALID_FILE;
+    }
+
+    if (dimm_vpd.struct_ver != VPD_STRUCT_VERSION) {
+        LOG_RANK(WARNING, rank, "invalid VPD structure version");
+        return DPU_ERR_VPD_INVALID_FILE;
+    }
+
+    if (repair_requested) {
+        while (fread(&entry, sizeof(entry), 1, vpd) == 1) {
+            repair_cnt++;
+
+            if (entry.rank != rank_index)
+                continue;
+
+            struct dpu_t *dpu = DPU_GET_UNSAFE(rank, entry.ci, entry.dpu);
+
+            struct dpu_memory_repair_t *repair_info;
+            if (entry.iram_wram == 0) { // IRAM
+                repair_info = &dpu->repair.iram_repair;
+            } else { // WRAM
+                repair_info = &dpu->repair.wram_repair[entry.bank];
+            }
+
+            uint32_t previous_nr_of_corrupted_addresses = repair_info->nr_of_corrupted_addresses++;
+            if (previous_nr_of_corrupted_addresses < NB_MAX_REPAIR_ADDR) {
+                repair_info->corrupted_addresses[previous_nr_of_corrupted_addresses].address = entry.address;
+                repair_info->corrupted_addresses[previous_nr_of_corrupted_addresses].faulty_bits = entry.bits;
+            }
+        }
+
+        if (repair_cnt != dimm_vpd.repair_count) {
+            LOG_RANK(WARNING, rank, "malformed VPD file");
+            return DPU_ERR_VPD_INVALID_FILE;
+        }
+    }
+
+    uint8_t nr_cis = rank->description->topology.nr_of_control_interfaces;
+    uint8_t nr_dpus = rank->description->topology.nr_of_dpus_per_control_interface;
+    uint64_t disabled_mask = dimm_vpd.ranks[rank_index].dpu_disabled;
+
+    for (uint8_t each_ci = 0; each_ci < nr_cis; ++each_ci) {
+        dpu_selected_mask_t disabled_mask_for_ci = (dpu_selected_mask_t)((disabled_mask >> (nr_dpus * each_ci)) & 0xFFl);
+
+        rank->runtime.control_interface.slice_info[each_ci].enabled_dpus
+            &= dpu_mask_difference(dpu_mask_all(nr_dpus), disabled_mask_for_ci);
+        rank->runtime.control_interface.slice_info[each_ci].all_dpus_are_enabled
+            = dpu_mask_intersection(rank->runtime.control_interface.slice_info[each_ci].enabled_dpus, dpu_mask_all(nr_dpus))
+            == dpu_mask_all(nr_dpus);
+    }
+
+    return DPU_OK;
+}
+
 /* Function used in dpu-diag */
 __API_SYMBOL__ bool
 is_kernel_module_compatible(void)
@@ -290,6 +417,14 @@ __PERF_PROFILING_SYMBOL__ __API_SYMBOL__ void
 log_rank_path(struct dpu_rank_t *rank, char *path)
 {
     LOG_RANK(INFO, rank, "rank path is: %s", path);
+}
+
+/* Function used in dpu-diag */
+__API_SYMBOL__ const char *
+get_rank_path(dpu_description_t description)
+{
+    hw_dpu_rank_allocation_parameters_t params = _this_params(description);
+    return params->rank_fs.rank_path;
 }
 
 static dpu_rank_status_e
@@ -445,6 +580,21 @@ hw_allocate(struct dpu_rank_t *rank, dpu_description_t description)
         }
     }
 
+    /* 7/ Inform DPUs about their SRAM defects,
+     * and update CIs runtime configuration
+     */
+    dpu_error_t repair_status = fill_sram_repairs_and_update_enabled_dpus(rank);
+    if (repair_status == DPU_ERR_VPD_INVALID_FILE) {
+        /* VPD file is corrupted, aborting rank allocation */
+        status = DPU_RANK_SYSTEM_ERROR;
+        goto free_real_xfer_matrix;
+    } else if (repair_status != DPU_OK) {
+        /* Failed to read VPD file, disabling repair but still return success */
+        LOG_RANK(WARNING, rank, "disabling SRAM repair");
+        description->configuration.do_iram_repair = false;
+        description->configuration.do_wram_repair = false;
+    }
+
     log_rank_path(rank, params->rank_fs.rank_path);
 
     return DPU_RANK_SUCCESS;
@@ -551,11 +701,11 @@ get_transfer_matrix_index(struct dpu_rank_t *rank, dpu_slice_id_t slice_id, dpu_
 }
 
 static dpu_rank_status_e
-hw_commit_commands(struct dpu_rank_t *rank, dpu_rank_buffer_t *buffer)
+hw_commit_commands(struct dpu_rank_t *rank, dpu_rank_buffer_t buffer)
 {
     hw_dpu_rank_context_t rank_context = _this(rank);
     hw_dpu_rank_allocation_parameters_t params = _this_params(rank->description);
-    dpu_rank_buffer_t ptr_buffer = *buffer;
+    dpu_rank_buffer_t ptr_buffer = buffer;
     int ret;
 
     if (params->interleave.nb_real_ci != rank->description->topology.nr_of_control_interfaces) {
@@ -564,7 +714,7 @@ hw_commit_commands(struct dpu_rank_t *rank, dpu_rank_buffer_t *buffer)
             memset(rank_context->real_buffer_control_interfaces, 0, params->interleave.nb_real_ci * sizeof(uint64_t));
 
             for (dpu_slice_id_t slice_id = 0; slice_id < rank->description->topology.nr_of_control_interfaces; ++slice_id)
-                rank_context->real_buffer_control_interfaces[get_real_slice_id(rank, slice_id)] = (*buffer)[slice_id];
+                rank_context->real_buffer_control_interfaces[get_real_slice_id(rank, slice_id)] = buffer[slice_id];
 
             ptr_buffer = rank_context->real_buffer_control_interfaces;
         }
@@ -605,11 +755,11 @@ hw_commit_commands(struct dpu_rank_t *rank, dpu_rank_buffer_t *buffer)
 }
 
 static dpu_rank_status_e
-hw_update_commands(struct dpu_rank_t *rank, dpu_rank_buffer_t *buffer)
+hw_update_commands(struct dpu_rank_t *rank, dpu_rank_buffer_t buffer)
 {
     hw_dpu_rank_context_t rank_context = _this(rank);
     hw_dpu_rank_allocation_parameters_t params = _this_params(rank->description);
-    dpu_rank_buffer_t ptr_buffer = *buffer;
+    dpu_rank_buffer_t ptr_buffer = buffer;
     int ret;
 
     if (params->interleave.nb_real_ci != rank->description->topology.nr_of_control_interfaces) {
@@ -659,7 +809,7 @@ hw_update_commands(struct dpu_rank_t *rank, dpu_rank_buffer_t *buffer)
                 if (slice_id >= rank->description->topology.nr_of_control_interfaces)
                     continue;
 
-                (*buffer)[slice_id] = rank_context->real_buffer_control_interfaces[real_slice_id];
+                buffer[slice_id] = rank_context->real_buffer_control_interfaces[real_slice_id];
             }
         }
     }
@@ -838,9 +988,9 @@ hw_fill_description_from_profile(dpu_properties_t properties, dpu_description_t 
     validate(fetch_integer_property(
         properties, DPU_PROFILE_PROPERTY_FCK_FREQUENCY, &fck_frequency, description->configuration.fck_frequency_in_mhz));
     validate(fetch_boolean_property(
-        properties, DPU_PROFILE_PROPERTY_TRY_REPAIR_IRAM, &(description->configuration.do_iram_repair), false));
+        properties, DPU_PROFILE_PROPERTY_TRY_REPAIR_IRAM, &(description->configuration.do_iram_repair), true));
     validate(fetch_boolean_property(
-        properties, DPU_PROFILE_PROPERTY_TRY_REPAIR_WRAM, &(description->configuration.do_wram_repair), false));
+        properties, DPU_PROFILE_PROPERTY_TRY_REPAIR_WRAM, &(description->configuration.do_wram_repair), true));
 
     /* FPGA specific */
     validate(

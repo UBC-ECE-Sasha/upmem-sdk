@@ -6,14 +6,15 @@
 #include <dpu_attributes.h>
 #include <dpu_custom.h>
 #include <dpu_api_log.h>
+#include <dpu_internals.h>
 #include <dpu_management.h>
 #include <dpu_rank_handler.h>
-#include <ufi_utils.h>
+#include <dpu_rank.h>
 
 __API_SYMBOL__ dpu_error_t
 dpu_custom_for_rank(struct dpu_rank_t *rank, dpu_custom_command_t command, dpu_custom_command_args_t args)
 {
-    LOGV(__vc(), "%s (%04x, %d)", __func__, rank->rank_id, command);
+    LOG_RANK(VERBOSE, rank, "%d", command);
 
     dpu_lock_rank(rank);
     dpu_rank_status_e status
@@ -26,7 +27,7 @@ dpu_custom_for_rank(struct dpu_rank_t *rank, dpu_custom_command_t command, dpu_c
 __API_SYMBOL__ dpu_error_t
 dpu_custom_for_dpu(struct dpu_t *dpu, dpu_custom_command_t command, dpu_custom_command_args_t args)
 {
-    LOGV(__vc(), "%s (%08x, %d)", __func__, dpu_get_id(dpu), command);
+    LOG_DPU(VERBOSE, dpu, "%d", command);
 
     if (!dpu->enabled) {
         return DPU_ERR_DPU_DISABLED;

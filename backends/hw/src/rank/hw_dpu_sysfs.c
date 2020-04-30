@@ -24,6 +24,8 @@
 #include "dpu_region_constants.h"
 #include "hw_dpu_sysfs.h"
 
+#define INVALID_RANK_INDEX 255
+
 #define init_udev_enumerator(enumerate, udev, sysname, subname, parent, devices, label)                                          \
     udev = udev_new();                                                                                                           \
     if (!udev) {                                                                                                                 \
@@ -407,5 +409,78 @@ dpu_sysfs_get_kernel_module_version(unsigned int *major, unsigned int *minor)
     }
 
     fclose(fp);
+    return 0;
+}
+
+int
+dpu_sysfs_get_dimm_serial_number(const char *rank_path, char **serial_number)
+{
+    unsigned int region_id;
+    unsigned int rank_id;
+    char *serial_number_path = NULL;
+
+    sscanf(rank_path, "/dev/dpu_region%d/dpu_rank%d", &region_id, &rank_id);
+
+    if (asprintf(&serial_number_path, "/sys/class/dpu_rank/dpu_region%d!dpu_rank%d/serial_number", region_id, rank_id) == -1) {
+        return -ENOMEM;
+    }
+
+    FILE *sn;
+
+    if ((sn = fopen(serial_number_path, "r")) == NULL) {
+        free(serial_number_path);
+        return -errno;
+    }
+    free(serial_number_path);
+
+    size_t len = 0;
+    if (getline(serial_number, &len, sn) == -1) {
+        fclose(sn);
+        return -errno;
+    }
+    fclose(sn);
+
+    (*serial_number)[strlen(*serial_number) - 1] = '\0';
+    if (strlen(*serial_number) == 0) {
+        /* Could not request DIMM serial number from MCU */
+        free(*serial_number);
+        return -1;
+    }
+
+    return 0;
+}
+
+int
+dpu_sysfs_get_rank_index(const char *rank_path, int *index)
+{
+    unsigned int region_id;
+    unsigned int rank_id;
+    char *rank_index_path = NULL;
+
+    sscanf(rank_path, "/dev/dpu_region%d/dpu_rank%d", &region_id, &rank_id);
+
+    if (asprintf(&rank_index_path, "/sys/class/dpu_rank/dpu_region%d!dpu_rank%d/rank_index", region_id, rank_id) == -1) {
+        return -ENOMEM;
+    }
+
+    FILE *idx;
+
+    if ((idx = fopen(rank_index_path, "r")) == NULL) {
+        free(rank_index_path);
+        return -errno;
+    }
+    free(rank_index_path);
+
+    if (fscanf(idx, "%d", index) != 1) {
+        fclose(idx);
+        return (errno != 0) ? -errno : -1;
+    }
+    fclose(idx);
+
+    if (*index == INVALID_RANK_INDEX) {
+        /* Could not request rank index from MCU */
+        return -1;
+    }
+
     return 0;
 }

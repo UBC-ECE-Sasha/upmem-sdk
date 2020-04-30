@@ -23,12 +23,12 @@ typedef enum _dpu_rank_status_e {
 
 typedef uint64_t *dpu_rank_buffer_t;
 
-typedef struct _dpu_rank_handler_t {
+typedef struct dpu_rank_handler {
     dpu_rank_status_e (*allocate)(struct dpu_rank_t *rank, dpu_description_t description);
     dpu_rank_status_e (*free)(struct dpu_rank_t *rank);
 
-    dpu_rank_status_e (*commit_commands)(struct dpu_rank_t *rank, dpu_rank_buffer_t *buffer);
-    dpu_rank_status_e (*update_commands)(struct dpu_rank_t *rank, dpu_rank_buffer_t *buffer);
+    dpu_rank_status_e (*commit_commands)(struct dpu_rank_t *rank, dpu_rank_buffer_t buffer);
+    dpu_rank_status_e (*update_commands)(struct dpu_rank_t *rank, dpu_rank_buffer_t buffer);
 
     dpu_rank_status_e (*copy_to_rank)(struct dpu_rank_t *rank, struct dpu_transfer_mram *transfer_matrix);
     dpu_rank_status_e (*copy_from_rank)(struct dpu_rank_t *rank, struct dpu_transfer_mram *transfer_matrix);
