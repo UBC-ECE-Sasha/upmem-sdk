@@ -29,7 +29,7 @@ static u8 next_ci(u8 ci_mask, u8 current_ci, u8 nr_cis)
 	for (i = next_ci(mask, -1, nr_cis); i < nr_cis;                        \
 	     i = next_ci(mask, i, nr_cis))
 
-#define IRAM_TIMING_SAFE_VALUE 0x04
+#define IRAM_TIMING_SAFE_VALUE 0x02
 #define IRAM_TIMING_NORMAL_VALUE 0x04
 #define IRAM_TIMING_AGGRESSIVE_VALUE 0x05
 
@@ -37,7 +37,7 @@ static u8 next_ci(u8 ci_mask, u8 current_ci, u8 nr_cis)
 #define RFRAM_TIMING_NORMAL_VALUE 0x04
 #define RFRAM_TIMING_AGGRESSIVE_VALUE 0x05
 
-#define WRAM_TIMING_SAFE_VALUE 0x05
+#define WRAM_TIMING_SAFE_VALUE 0x02
 #define WRAM_TIMING_NORMAL_VALUE 0x05
 #define WRAM_TIMING_AGGRESSIVE_VALUE 0x06
 
